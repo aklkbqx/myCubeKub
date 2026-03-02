@@ -1,0 +1,25 @@
+{
+    "name": "@mycubekub/api",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "dev": "bun run --watch src/index.ts",
+        "start": "bun run src/index.ts",
+        "build": "bun build src/index.ts --outdir dist --target bun"
+    },
+    "dependencies": {
+        "elysia": "^1.2.0",
+        "@elysiajs/cors": "^1.2.0",
+        "drizzle-orm": "^0.38.0",
+        "postgres": "^3.4.0",
+        "dockerode": "^4.0.0",
+        "bcryptjs": "^2.4.3"
+    },
+    "devDependencies": {
+        "@types/dockerode": "^3.3.0",
+        "@types/bcryptjs": "^2.4.0",
+        "drizzle-kit": "^0.30.0",
+        "typescript": "^5.7.0",
+        "@types/bun": "latest"
+    }
+}

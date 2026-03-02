@@ -1,0 +1,22 @@
+{
+    "name": "mycubekub",
+    "private": true,
+    "workspaces": [
+        "apps/*"
+    ],
+    "scripts": {
+        "dev:api": "bun run --watch apps/api/src/index.ts",
+        "dev:web": "bun run --cwd apps/web vite --host",
+        "dev": "bun run dev:api & bun run dev:web",
+        "db:generate": "bunx --bun drizzle-kit generate --config apps/api/drizzle.config.ts",
+        "db:migrate": "bunx --bun drizzle-kit migrate --config apps/api/drizzle.config.ts",
+        "db:push": "bunx --bun drizzle-kit push --config apps/api/drizzle.config.ts",
+        "db:studio": "bunx --bun drizzle-kit studio --config apps/api/drizzle.config.ts",
+        "db:seed": "bun run apps/api/src/db/seed.ts"
+    },
+    "devDependencies": {
+        "drizzle-kit": "^0.31.9",
+        "drizzle-orm": "^0.45.1",
+        "postgres": "^3.4.8"
+    }
+}

@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+
+# Bun
+bun.lockb
+
+# Drizzle
+drizzle/
+
+# Servers data (mounted volume)
+servers/*/data/
+
+# Backups (mounted volume)
+backups/*.tar.gz
