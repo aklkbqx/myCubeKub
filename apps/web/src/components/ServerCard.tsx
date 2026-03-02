@@ -35,21 +35,21 @@ export function ServerCard({ server, onStart, onStop, onRestart, onDelete, conne
       <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-brand-500 via-emerald-400 to-cyan-400 opacity-80" />
 
       {/* Header */}
-      <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-3">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0 flex items-center gap-3">
           <div>
             <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-brand-500/20 bg-brand-600/15 text-brand-300 group-hover:bg-brand-600/25 transition-colors">
               <Server size={20} />
             </div>
           </div>
-          <div>
-            <h3 className="text-lg font-semibold text-surface-50">{server.name}</h3>
-            <p className="mt-1 text-xs uppercase tracking-[0.2em] text-surface-400">
+          <div className="min-w-0">
+            <h3 className="truncate text-lg font-semibold text-surface-50">{server.name}</h3>
+            <p className="mt-1 break-all text-xs uppercase tracking-[0.2em] text-surface-400">
               {server.type} · v{server.version} · {connectionAddress}
             </p>
           </div>
         </div>
-        <StatusBadge status={server.status} />
+        <StatusBadge status={server.status} className="self-start sm:self-auto" />
       </div>
 
       <div className="mb-4 flex flex-wrap gap-2">
@@ -72,14 +72,14 @@ export function ServerCard({ server, onStart, onStop, onRestart, onDelete, conne
           </p>
         </div>
       ) : (
-        <div className="mb-4 flex items-center justify-between rounded-xl border border-surface-800 bg-surface-950/40 px-3 py-3 text-xs text-surface-400">
+        <div className="mb-4 flex flex-col gap-1 rounded-xl border border-surface-800 bg-surface-950/40 px-3 py-3 text-xs text-surface-400 sm:flex-row sm:items-center sm:justify-between">
           <span>Allocated: {server.memoryMb} MB</span>
           <span>{isRunning ? "Server online" : "Ready to start"}</span>
         </div>
       )}
 
       {/* Actions */}
-      <div className="flex gap-2 border-t border-surface-700/50 pt-4" onClick={(e) => e.stopPropagation()}>
+      <div className="flex flex-wrap gap-2 border-t border-surface-700/50 pt-4" onClick={(e) => e.stopPropagation()}>
         {isServerMissing ? (
           <>
             <button
@@ -137,7 +137,7 @@ export function ServerCard({ server, onStart, onStop, onRestart, onDelete, conne
             <button
               onClick={() => handleAction("restart", onRestart)}
               disabled={loading !== null}
-              className="btn-secondary flex items-center justify-center gap-2 text-sm px-3 disabled:opacity-50"
+              className="btn-secondary flex min-w-[52px] items-center justify-center gap-2 text-sm px-3 disabled:opacity-50"
             >
               {loading === "restart" ? (
                 <span className="animate-spin">⟳</span>

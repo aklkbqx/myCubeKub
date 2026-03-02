@@ -1,0 +1,9 @@
+{
+  "name": "@mycubekub/api-contract",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

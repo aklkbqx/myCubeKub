@@ -1,6 +1,74 @@
 import Docker from "dockerode";
+import { existsSync } from "fs";
+import { homedir } from "os";
 
-const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+const DOCKER_BINARY_CANDIDATES = [
+  process.env.DOCKER_BIN,
+  "/usr/local/bin/docker",
+  "/opt/homebrew/bin/docker",
+  "/Applications/Docker.app/Contents/Resources/bin/docker",
+  "docker",
+].filter((value): value is string => Boolean(value));
+
+const DOCKER_SOCKET_CANDIDATES = [
+  process.env.DOCKER_SOCKET_PATH,
+  process.env.DOCKER_HOST?.startsWith("unix://")
+    ? process.env.DOCKER_HOST.slice("unix://".length)
+    : undefined,
+  "/var/run/docker.sock",
+  `${homedir()}/.docker/run/docker.sock`,
+].filter((value): value is string => Boolean(value));
+
+function resolveDockerBinary(): string {
+  for (const candidate of DOCKER_BINARY_CANDIDATES) {
+    if (candidate === "docker" || existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    'Docker CLI not found. Set DOCKER_BIN in apps/api/.env, or make "docker" available in PATH.'
+  );
+}
+
+function resolveDockerSocketPath(): string {
+  for (const candidate of DOCKER_SOCKET_CANDIDATES) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return DOCKER_SOCKET_CANDIDATES[0] || "/var/run/docker.sock";
+}
+
+const docker = new Docker({ socketPath: resolveDockerSocketPath() });
+const dockerBinary = resolveDockerBinary();
+
+function getSpawnEnv() {
+  return {
+    ...process.env,
+    PATH: [
+      process.env.PATH,
+      "/usr/local/bin",
+      "/opt/homebrew/bin",
+      "/Applications/Docker.app/Contents/Resources/bin",
+    ]
+      .filter(Boolean)
+      .join(":"),
+  };
+}
+
+function getDockerCommandError(action: string, stderr: string): Error {
+  const detail = stderr.trim();
+
+  if (detail.includes("Executable not found in $PATH")) {
+    return new Error(
+      `Docker CLI not found for ${action}. Set DOCKER_BIN in apps/api/.env or add docker to PATH.`
+    );
+  }
+
+  return new Error(`docker ${action} failed: ${detail}`);
+}
 
 /**
  * Get container name for a server (convention: mcserver-{serverId})
@@ -108,15 +176,16 @@ export async function listMcContainers() {
  * Run docker compose up -d in a server directory
  */
 export async function composeUp(serverDir: string): Promise<void> {
-  const proc = Bun.spawn(["docker", "compose", "up", "-d"], {
+  const proc = Bun.spawn([dockerBinary, "compose", "up", "-d"], {
     cwd: serverDir,
     stdout: "pipe",
     stderr: "pipe",
+    env: getSpawnEnv(),
   });
   const exitCode = await proc.exited;
   if (exitCode !== 0) {
     const stderr = await new Response(proc.stderr).text();
-    throw new Error(`docker compose up failed: ${stderr}`);
+    throw getDockerCommandError("compose up", stderr);
   }
 }
 
@@ -124,15 +193,16 @@ export async function composeUp(serverDir: string): Promise<void> {
  * Run docker compose down in a server directory (removes container)
  */
 export async function composeDown(serverDir: string): Promise<void> {
-  const proc = Bun.spawn(["docker", "compose", "down", "-v"], {
+  const proc = Bun.spawn([dockerBinary, "compose", "down", "-v"], {
     cwd: serverDir,
     stdout: "pipe",
     stderr: "pipe",
+    env: getSpawnEnv(),
   });
   const exitCode = await proc.exited;
   if (exitCode !== 0) {
     const stderr = await new Response(proc.stderr).text();
-    throw new Error(`docker compose down failed: ${stderr}`);
+    throw getDockerCommandError("compose down", stderr);
   }
 }
 

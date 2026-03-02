@@ -1,9 +1,80 @@
 import { Elysia, t } from "elysia";
 import { db, schema } from "../db";
 import { and, eq, ne } from "drizzle-orm";
-import { authGuard } from "./auth";
 import * as dockerService from "../services/docker";
 import * as composeService from "../services/compose";
+import authGuard from "../services/authGuard";
+import { cacheService } from "../services/CacheService";
+import { CACHE_TTL, cacheKeys } from "../services/cacheKeys";
+
+const errorResponse = t.Object({
+  error: t.String(),
+});
+
+const serverStatsSchema = t.Object({
+  cpuPercent: t.Number(),
+  memoryUsage: t.Number(),
+  memoryLimit: t.Number(),
+  memoryPercent: t.Number(),
+});
+
+const serverStatusSchema = t.Union([
+  t.Literal("running"),
+  t.Literal("stopped"),
+  t.Literal("error"),
+  t.Literal("not_found"),
+]);
+
+const serverInfoSchema = t.Object({
+  id: t.String(),
+  name: t.String(),
+  directoryPath: t.String(),
+  port: t.Number(),
+  version: t.String(),
+  type: t.String(),
+  memoryMb: t.Number(),
+  statusCache: t.Nullable(t.String()),
+  createdAt: t.String(),
+  updatedAt: t.String(),
+});
+
+const serverWithStatusSchema = t.Object({
+  ...serverInfoSchema.properties,
+  status: serverStatusSchema,
+  stats: t.Nullable(serverStatsSchema),
+});
+
+type ServerStatus = "running" | "stopped" | "error" | "not_found";
+
+interface ServerStats {
+  cpuPercent: number;
+  memoryUsage: number;
+  memoryLimit: number;
+  memoryPercent: number;
+}
+
+interface SerializedServerWithStatus {
+  id: string;
+  name: string;
+  directoryPath: string;
+  port: number;
+  version: string;
+  type: string;
+  memoryMb: number;
+  statusCache: string | null;
+  createdAt: string;
+  updatedAt: string;
+  status: ServerStatus;
+  stats: ServerStats | null;
+}
+
+function serializeServer<T extends { createdAt: Date; updatedAt: Date }>(server: T) {
+  return {
+    ...server,
+    createdAt: server.createdAt.toISOString(),
+    updatedAt: server.updatedAt.toISOString(),
+  };
+}
 
 async function findServerByPort(port: number, excludeId?: string) {
   const conditions = excludeId
@@ -34,11 +105,104 @@ function isUniquePortViolation(err: unknown) {
   );
 }
 
-export const serverRoutes = new Elysia({ prefix: "/servers" })
+async function invalidateServerCache(serverId: string) {
+  await cacheService.delMany([
+    cacheKeys.servers.list,
+    cacheKeys.servers.detail(serverId),
+    cacheKeys.servers.stats(serverId),
+    cacheKeys.servers.properties(serverId),
+  ]);
+}
+
+async function rebuildServerRuntime(serverId: string) {
+  const [server] = await db
+    .select()
+    .from(schema.servers)
+    .where(eq(schema.servers.id, serverId))
+    .limit(1);
+
+  if (!server) {
+    return null;
+  }
+
+  await dockerService.removeContainer(serverId).catch(() => undefined);
+
+  try {
+    await dockerService.composeDown(composeService.getServerDir(serverId));
+  } catch {
+    // Ignore compose cleanup failures during rebuild.
+  }
+
+  await composeService.deleteServerFiles(serverId);
+
+  const serverDir = await composeService.createServerFiles({
+    serverId: server.id,
+    name: server.name,
+    port: server.port,
+    version: server.version,
+    type: server.type,
+    memoryMb: server.memoryMb,
+  });
+
+  await db
+    .update(schema.servers)
+    .set({
+      directoryPath: serverDir,
+      statusCache: "stopped",
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.servers.id, server.id));
+
+  await dockerService.composeUp(serverDir);
+
+  const [updated] = await db
+    .update(schema.servers)
+    .set({
+      directoryPath: serverDir,
+      statusCache: "running",
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.servers.id, server.id))
+    .returning();
+
+  await invalidateServerCache(server.id);
+
+  return updated;
+}
+
+async function getSerializedServer(serverId: string): Promise<SerializedServerWithStatus | null> {
+  const [server] = await db
+    .select()
+    .from(schema.servers)
+    .where(eq(schema.servers.id, serverId))
+    .limit(1);
+
+  if (!server) {
+    return null;
+  }
+
+  const status = await dockerService.getContainerStatus(serverId);
+  const stats = status === "running"
+    ? await dockerService.getContainerStats(serverId)
+    : null;
+
+  return {
+    ...serializeServer(server),
+    status,
+    stats,
+  };
+}
+
+const serverRoutes = new Elysia({ prefix: "/servers" })
   .use(authGuard)
 
   // ─── Guard: check auth on all server routes ────────────────
-  .onBeforeHandle(({ user, set }) => {
+  .onBeforeHandle(({ user, authUnavailable, set }) => {
+    if (authUnavailable) {
+      set.status = 503;
+      return { error: "Authentication schema is not ready. Run database migrations first." };
+    }
+
     if (!user) {
       set.status = 401;
       return { error: "Not authenticated" };
@@ -47,52 +211,71 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
 
   // ─── List all servers ──────────────────────────────────────
   .get("/", async () => {
-    const allServers = await db.select().from(schema.servers);
+    const payload = await cacheService.remember(
+      cacheKeys.servers.list,
+      CACHE_TTL.serverList,
+      async () => {
+        const allServers = await db.select().from(schema.servers);
+        const enriched = await Promise.all(
+          allServers.map(async (server) => {
+            const status = await dockerService.getContainerStatus(server.id);
+            const stats = status === "running"
+              ? await dockerService.getContainerStats(server.id)
+              : null;
 
-    // Enrich with Docker status
-    const enriched = await Promise.all(
-      allServers.map(async (server) => {
-        const status = await dockerService.getContainerStatus(server.id);
-        let stats = null;
-        if (status === "running") {
-          stats = await dockerService.getContainerStats(server.id);
-        }
-        return {
-          ...server,
-          status,
-          stats,
-        };
-      })
+            return {
+              ...serializeServer(server),
+              status,
+              stats,
+            };
+          })
+        );
+
+        return { servers: enriched };
+      }
     );
 
-    return { servers: enriched };
+    return payload;
+  }, {
+    response: {
+      200: t.Object({ servers: t.Array(serverWithStatusSchema) }),
+      401: errorResponse,
+    },
   })
 
   // ─── Get single server ────────────────────────────────────
   .get(
     "/:id",
     async ({ params: { id }, set }) => {
-      const [server] = await db
-        .select()
-        .from(schema.servers)
-        .where(eq(schema.servers.id, id))
-        .limit(1);
+      const cached = await cacheService.get<{ server: SerializedServerWithStatus }>(
+        cacheKeys.servers.detail(id)
+      );
+      if (cached?.server) {
+        return cached;
+      }
 
+      const server = await getSerializedServer(id);
       if (!server) {
         set.status = 404;
         return { error: "Server not found" };
       }
 
-      const status = await dockerService.getContainerStatus(id);
-      let stats = null;
-      if (status === "running") {
-        stats = await dockerService.getContainerStats(id);
-      }
+      const payload = { server };
+      await cacheService.set(
+        cacheKeys.servers.detail(id),
+        payload,
+        CACHE_TTL.serverDetail
+      );
 
-      return { server: { ...server, status, stats } };
+      return payload;
     },
     {
       params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({ server: serverWithStatusSchema }),
+        401: errorResponse,
+        404: errorResponse,
+      },
     }
   )
 
@@ -152,14 +335,21 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
           .set({ statusCache: "running", updatedAt: new Date() })
           .where(eq(schema.servers.id, server.id));
 
+        await invalidateServerCache(server.id);
+
         return {
-          server: { ...server, directoryPath: serverDir, status: "running" },
+          server: {
+            ...serializeServer(server),
+            directoryPath: serverDir,
+            statusCache: "running",
+          },
         };
       } catch (err: any) {
         if (createdServerId) {
           await dockerService.removeContainer(createdServerId).catch(() => undefined);
           await composeService.deleteServerFiles(createdServerId).catch(() => undefined);
           await db.delete(schema.servers).where(eq(schema.servers.id, createdServerId)).catch(() => undefined);
+          await invalidateServerCache(createdServerId);
         }
         if (isUniquePortViolation(err)) {
           set.status = 409;
@@ -177,6 +367,12 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
         type: t.Optional(t.String()),
         memoryMb: t.Optional(t.Number({ minimum: 512 })),
       }),
+      response: {
+        200: t.Object({ server: serverInfoSchema }),
+        401: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
     }
   )
 
@@ -238,7 +434,9 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
           body.type !== undefined ||
           body.memoryMb !== undefined;
 
-        return { server: updated, restartRequired };
+        await invalidateServerCache(id);
+
+        return { server: serializeServer(updated), restartRequired };
       } catch (err: any) {
         if (isUniquePortViolation(err)) {
           set.status = 409;
@@ -258,6 +456,16 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
         memoryMb: t.Optional(t.Number({ minimum: 512 })),
         jvmArgs: t.Optional(t.String()),
       }),
+      response: {
+        200: t.Object({
+          server: serverInfoSchema,
+          restartRequired: t.Boolean(),
+        }),
+        401: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
     }
   )
 
@@ -292,6 +500,8 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
         // Delete from DB (cascades to backups)
         await db.delete(schema.servers).where(eq(schema.servers.id, id));
 
+        await invalidateServerCache(id);
+
         return { success: true };
       } catch (err: any) {
         set.status = 500;
@@ -300,6 +510,12 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
     },
     {
       params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({ success: t.Boolean() }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
     }
   )
 
@@ -326,6 +542,7 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
           .update(schema.servers)
           .set({ statusCache: "running", updatedAt: new Date() })
           .where(eq(schema.servers.id, id));
+        await invalidateServerCache(id);
         return { success: true, status: "running" };
       } catch (err: any) {
         set.status = 500;
@@ -334,6 +551,12 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
     },
     {
       params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({ success: t.Boolean(), status: t.String() }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
     }
   )
 
@@ -358,6 +581,7 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
           .update(schema.servers)
           .set({ statusCache: "stopped", updatedAt: new Date() })
           .where(eq(schema.servers.id, id));
+        await invalidateServerCache(id);
         return { success: true, status: "stopped" };
       } catch (err: any) {
         set.status = 500;
@@ -366,6 +590,12 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
     },
     {
       params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({ success: t.Boolean(), status: t.String() }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
     }
   )
 
@@ -390,6 +620,7 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
           .update(schema.servers)
           .set({ statusCache: "running", updatedAt: new Date() })
           .where(eq(schema.servers.id, id));
+        await invalidateServerCache(id);
         return { success: true, status: "running" };
       } catch (err: any) {
         set.status = 500;
@@ -398,6 +629,59 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
     },
     {
       params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({ success: t.Boolean(), status: t.String() }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+
+  // ─── Recreate server runtime from current settings ────────
+  .post(
+    "/:id/recreate",
+    async ({ params: { id }, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      try {
+        const recreated = await rebuildServerRuntime(id);
+        if (!recreated) {
+          set.status = 404;
+          return { error: "Server not found" };
+        }
+
+        return {
+          success: true,
+          status: "running",
+          server: serializeServer(recreated),
+        };
+      } catch (err: any) {
+        set.status = 500;
+        return { error: `Failed to recreate server: ${err.message}` };
+      }
+    },
+    {
+      params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({
+          success: t.Boolean(),
+          status: t.String(),
+          server: serverInfoSchema,
+        }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
     }
   )
 
@@ -418,14 +702,31 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
 
       const status = await dockerService.getContainerStatus(id);
       if (status !== "running") {
+        await cacheService.del(cacheKeys.servers.stats(id));
         return { stats: null, status };
       }
 
-      const stats = await dockerService.getContainerStats(id);
-      return { stats, status };
+      const payload = await cacheService.remember(
+        cacheKeys.servers.stats(id),
+        CACHE_TTL.serverStats,
+        async () => ({
+          stats: await dockerService.getContainerStats(id),
+          status,
+        })
+      );
+
+      return payload;
     },
     {
       params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({
+          stats: t.Nullable(serverStatsSchema),
+          status: t.String(),
+        }),
+        401: errorResponse,
+        404: errorResponse,
+      },
     }
   )
 
@@ -444,11 +745,25 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
         return { error: "Server not found" };
       }
 
-      const properties = await composeService.readServerProperties(id);
-      return { properties };
+      const payload = await cacheService.remember(
+        cacheKeys.servers.properties(id),
+        CACHE_TTL.serverProperties,
+        async () => ({
+          properties: await composeService.readServerProperties(id),
+        })
+      );
+
+      return payload;
     },
     {
       params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({
+          properties: t.Record(t.String(), t.String()),
+        }),
+        401: errorResponse,
+        404: errorResponse,
+      },
     }
   )
 
@@ -469,6 +784,7 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
 
       try {
         await composeService.writeServerProperties(id, body.properties);
+        await invalidateServerCache(id);
         return { success: true };
       } catch (err: any) {
         set.status = 500;
@@ -480,5 +796,14 @@ export const serverRoutes = new Elysia({ prefix: "/servers" })
       body: t.Object({
         properties: t.Record(t.String(), t.String()),
       }),
+      response: {
+        200: t.Object({ success: t.Boolean() }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
     }
   );
+
+
+export default serverRoutes

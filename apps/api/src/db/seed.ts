@@ -1,15 +1,9 @@
-/**
- * Seed script — creates default admin user
- * Run: bun run src/db/seed.ts
- */
 import { db, schema } from "./index";
-import bcrypt from "bcryptjs";
 
 async function seed() {
   console.log("🌱 Seeding database...");
 
-  // Create admin user
-  const passwordHash = await bcrypt.hash("admin", 10);
+  const passwordHash = await Bun.password.hash("admin", 'argon2id');
 
   const [user] = await db
     .insert(schema.users)

@@ -1,6 +1,6 @@
 # myCubeKub
 
-Minecraft server management panel built as a Bun monorepo with a React frontend, an Elysia API, PostgreSQL for metadata, and per-server runtime provisioning on the host machine.
+Minecraft server management panel built as a Bun multi-project repo with a React frontend, an Elysia API, a shared API contract package, PostgreSQL for metadata, and per-server runtime provisioning on the host machine.
 
 ## Overview
 
@@ -56,17 +56,18 @@ If provisioning fails after the database row is created, cleanup logic removes t
 
 ## Architecture
 
-### Monorepo layout
+### Repo Layout
 
 ```text
 .
 |-- apps/
 |   |-- api/   # Bun + Elysia + Drizzle + Docker integration
 |   `-- web/   # React + Vite + Tailwind frontend
+|-- packages/
+|   `-- api-contract/   # shared Elysia App type for Eden
 |-- servers/   # Generated per-server runtime directories
 |-- backups/   # Reserved backup storage
-|-- docker-compose.yml
-`-- package.json
+`-- README.md
 ```
 
 ### Frontend
@@ -89,7 +90,8 @@ Frontend responsibilities:
 - create/edit server forms
 - status presentation
 - file browser and editor
-- WebSocket console UI
+- Eden client for typed API access
+- WebSocket console UI via Eden treaty
 - user-facing error and loading states
 
 ### API
@@ -115,6 +117,12 @@ API responsibilities:
 - file system operations
 - console log streaming and command execution
 - config exposure such as `CONNECTION_IP`
+
+### Shared contract
+
+Location: `packages/api-contract`
+
+This package exports the Elysia `App` type from the API so the web app can use `edenTreaty<App>(...)` with shared route, params, body, and WebSocket message types.
 
 ### Database
 
@@ -217,7 +225,8 @@ High-level routes exposed by the API:
 - `POST /servers/:id/files/mkdir`
 - `DELETE /servers/:id/files`
 - `PATCH /servers/:id/files/rename`
-- download endpoint exposed from the same namespace
+- `POST /servers/:id/files/upload`
+- `GET /servers/:id/files/download`
 
 ### Console
 
@@ -225,7 +234,7 @@ High-level routes exposed by the API:
 
 ## Environment Variables
 
-Root `.env.example`:
+API environment file:
 
 ```env
 DATABASE_URL=postgresql://mycubekub:mycubekub@localhost:5432/mycubekub
@@ -253,29 +262,35 @@ Meaning:
 ### 1. Install dependencies
 
 ```bash
-bun install
+cd apps/api && bun install
+cd ../web && bun install
 ```
+
+The repo now keeps lockfiles per project:
+
+- `apps/api/bun.lock`
+- `apps/web/bun.lock`
 
 ### 2. Create environment files
 
-At minimum, create a root `.env` from `.env.example`.
+Create `apps/api/.env` from `apps/api/.env.example`.
 
-If you also use `apps/api/.env`, keep it aligned with the same values used by the root environment and Docker environment.
+If needed, create `apps/web/.env` from `apps/web/.env.example`.
 
 ### 3. Start PostgreSQL
 
-You can either run your own PostgreSQL instance or use the root `docker-compose.yml`.
+You can run your own PostgreSQL instance or start one with Docker separately.
 
 ### 4. Apply database migrations
 
 ```bash
-bun run db:migrate
+cd apps/api && bun run db:migrate
 ```
 
 ### 5. Seed the default admin user
 
 ```bash
-bun run db:seed
+cd apps/api && bun run db:seed
 ```
 
 Default seeded credentials:
@@ -288,56 +303,40 @@ Change this immediately for any real deployment.
 ### 6. Start the apps in development mode
 
 ```bash
-bun run dev
+cd apps/api && bun dev
+cd ../web && bun dev
 ```
 
-That runs:
+That starts:
 
 - API: `http://localhost:3000`
 - Web: `http://localhost:5173`
 
-## Running with Docker Compose
-
-The root `docker-compose.yml` starts:
-
-- `api`
-- `web`
-- `db`
-
-Start the full stack:
-
-```bash
-docker compose up --build
-```
-
-Default exposed ports:
-
-- web: `80`
-- api: `3000`
-- db: `5432`
-
-Mounted directories:
-
-- `./servers -> /app/servers`
-- `./backups -> /app/backups`
-- `/var/run/docker.sock -> /var/run/docker.sock`
-
-The Docker socket mount is required because the API manages Minecraft server runtimes from the host.
-
 ## Available Scripts
 
-From the repository root:
+From each project directory:
 
 ```bash
-bun run dev
-bun run dev:api
-bun run dev:web
-bun run db:generate
-bun run db:migrate
-bun run db:push
-bun run db:studio
-bun run db:seed
+cd apps/api && bun dev
+cd apps/api && bun run typecheck
+cd apps/api && bun run test:smoke
+cd apps/api && bun run db:migrate
+cd apps/api && bun run db:seed
+cd apps/web && bun dev
+cd apps/web && bun run typecheck
 ```
+
+## Type-Safe API Integration
+
+The frontend uses Elysia Eden with the shared contract package:
+
+- `apps/api/src/app.ts` exports `type App`
+- `packages/api-contract` re-exports that type
+- `apps/web/src/lib/api.ts` creates `edenTreaty<App>("/api")`
+
+This gives typed route params, request bodies, JSON responses, file upload bodies, and console WebSocket messages across projects.
+
+The main exception is file download, which remains a URL helper because it returns a binary file response instead of JSON.
 
 ## Data and File Layout
 

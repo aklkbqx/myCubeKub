@@ -1,15 +1,61 @@
 import { Elysia, t } from "elysia";
-import { db, schema } from "../db";
-import { eq } from "drizzle-orm";
-import { authGuard } from "./auth";
+import authGuard from "../services/authGuard";
 import * as dockerService from "../services/docker";
 
-export const consoleRoutes = new Elysia({ prefix: "/servers" })
+const consoleCommandSchema = t.Object({
+  type: t.Literal("command"),
+  command: t.String(),
+});
+
+const consoleEventSchema = t.Union([
+  t.Object({
+    type: t.Literal("log"),
+    data: t.String(),
+    timestamp: t.String(),
+  }),
+  t.Object({
+    type: t.Literal("error"),
+    data: t.String(),
+  }),
+  t.Object({
+    type: t.Literal("info"),
+    data: t.String(),
+  }),
+  t.Object({
+    type: t.Literal("command_result"),
+    command: t.String(),
+    data: t.String(),
+    timestamp: t.String(),
+  }),
+]);
+
+const consoleRoutes = new Elysia({ prefix: "/servers" })
   .use(authGuard)
 
   // ─── WebSocket console (logs + RCON) ──────────────────────
   .ws("/:id/console", {
+    params: t.Object({ id: t.String() }),
+    body: consoleCommandSchema,
+    response: consoleEventSchema,
     open(ws) {
+      if ((ws.data as any).authUnavailable) {
+        ws.send({
+          type: "error",
+          data: "Authentication schema is not ready. Run database migrations first.",
+        });
+        ws.close();
+        return;
+      }
+
+      if (!(ws.data as any).user) {
+        ws.send({
+          type: "error",
+          data: "Not authenticated",
+        });
+        ws.close();
+        return;
+      }
+
       const id = (ws.data.params as any).id;
       console.log(`[WS] Console opened for server ${id}`);
 
@@ -47,13 +93,11 @@ export const consoleRoutes = new Elysia({ prefix: "/servers" })
 
             if (cleanLines.trim()) {
               try {
-                ws.send(
-                  JSON.stringify({
-                    type: "log",
-                    data: cleanLines,
-                    timestamp: new Date().toISOString(),
-                  })
-                );
+                ws.send({
+                  type: "log",
+                  data: cleanLines,
+                  timestamp: new Date().toISOString(),
+                });
               } catch {
                 // ws might be closed
               }
@@ -62,12 +106,10 @@ export const consoleRoutes = new Elysia({ prefix: "/servers" })
 
           stream.on("error", (err: Error) => {
             try {
-              ws.send(
-                JSON.stringify({
-                  type: "error",
-                  data: `Log stream error: ${err.message}`,
-                })
-              );
+              ws.send({
+                type: "error",
+                data: `Log stream error: ${err.message}`,
+              });
             } catch {
               // ws might be closed
             }
@@ -75,24 +117,20 @@ export const consoleRoutes = new Elysia({ prefix: "/servers" })
 
           stream.on("end", () => {
             try {
-              ws.send(
-                JSON.stringify({
-                  type: "info",
-                  data: "Log stream ended",
-                })
-              );
+              ws.send({
+                type: "info",
+                data: "Log stream ended",
+              });
             } catch {
               // ws might be closed
             }
           });
         })
         .catch((err) => {
-          ws.send(
-            JSON.stringify({
-              type: "error",
-              data: `Failed to attach logs: ${err.message}`,
-            })
-          );
+          ws.send({
+            type: "error",
+            data: `Failed to attach logs: ${err.message}`,
+          });
         });
     },
 
@@ -129,31 +167,25 @@ export const consoleRoutes = new Elysia({ prefix: "/servers" })
                 .join("\n")
                 .trim();
 
-              ws.send(
-                JSON.stringify({
-                  type: "command_result",
-                  command: msg.command,
-                  data: cleanOutput || "(no output)",
-                  timestamp: new Date().toISOString(),
-                })
-              );
+              ws.send({
+                type: "command_result",
+                command: msg.command,
+                data: cleanOutput || "(no output)",
+                timestamp: new Date().toISOString(),
+              });
             });
           } catch (err: any) {
-            ws.send(
-              JSON.stringify({
-                type: "error",
-                data: `RCON error: ${err.message}`,
-              })
-            );
+            ws.send({
+              type: "error",
+              data: `RCON error: ${err.message}`,
+            });
           }
         }
       } catch (err: any) {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            data: `Message error: ${err.message}`,
-          })
-        );
+        ws.send({
+          type: "error",
+          data: `Message error: ${err.message}`,
+        });
       }
     },
 
@@ -168,3 +200,7 @@ export const consoleRoutes = new Elysia({ prefix: "/servers" })
       }
     },
   });
+
+
+
+export default consoleRoutes

@@ -58,19 +58,19 @@
   }
 
   .btn-primary {
-    @apply bg-brand-600 hover:bg-brand-500 text-white font-medium px-4 py-2 rounded-lg transition-all duration-200 active:scale-[0.98] shadow-lg shadow-brand-600/25 border border-brand-400/20;
+    @apply bg-brand-600 hover:bg-brand-500 text-white font-medium px-4 py-2.5 rounded-lg transition-all duration-200 active:scale-[0.98] shadow-lg shadow-brand-600/25 border border-brand-400/20;
   }
 
   .btn-secondary {
-    @apply bg-surface-700 hover:bg-surface-600 text-surface-100 font-medium px-4 py-2 rounded-lg transition-all duration-200 active:scale-[0.98] border border-surface-600/70;
+    @apply bg-surface-700 hover:bg-surface-600 text-surface-100 font-medium px-4 py-2.5 rounded-lg transition-all duration-200 active:scale-[0.98] border border-surface-600/70;
   }
 
   .btn-danger {
-    @apply bg-red-600/80 hover:bg-red-500 text-white font-medium px-4 py-2 rounded-lg transition-all duration-200 active:scale-[0.98] border border-red-400/20;
+    @apply bg-red-600/80 hover:bg-red-500 text-white font-medium px-4 py-2.5 rounded-lg transition-all duration-200 active:scale-[0.98] border border-red-400/20;
   }
 
   .btn-icon {
-    @apply p-2 rounded-lg transition-all duration-200 active:scale-[0.95] hover:bg-surface-700/80;
+    @apply p-2.5 rounded-lg transition-all duration-200 active:scale-[0.95] hover:bg-surface-700/80;
   }
 
   .input-field {
@@ -116,7 +116,7 @@
   }
 
   .game-tab {
-    @apply flex items-center gap-2 rounded-xl border px-4 py-2 text-sm font-medium transition-all duration-200;
+    @apply flex min-h-[44px] items-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-medium transition-all duration-200;
   }
 
   .game-tab-active {

@@ -53,7 +53,7 @@ export function CreateServerModal({ open, onClose, onCreate, usedPorts }: Create
   };
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center px-4">
+    <div className="fixed inset-0 z-[100] flex items-end justify-center px-3 py-3 sm:items-center sm:px-4">
       {/* Backdrop */}
       <div
         className="absolute inset-0 bg-black/60 bacdrop-blur-sm"
@@ -61,7 +61,7 @@ export function CreateServerModal({ open, onClose, onCreate, usedPorts }: Create
       />
 
       {/* Modal */}
-      <div className="card relative w-full max-w-lg animate-slide-up z-10">
+      <div className="card relative z-10 max-h-[92vh] w-full max-w-lg animate-slide-up overflow-y-auto p-4 sm:p-5">
         {loading && <LoadingOverlay message="Creating server" subtle />}
         <div className="flex items-center justify-between mb-6">
           <h2 className="text-xl font-bold text-surface-100">Create Server</h2>
@@ -94,7 +94,7 @@ export function CreateServerModal({ open, onClose, onCreate, usedPorts }: Create
           </div>
 
           {/* Type + Version */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <label className="block text-sm font-medium text-surface-300 mb-1.5">
                 Server Type
@@ -120,7 +120,7 @@ export function CreateServerModal({ open, onClose, onCreate, usedPorts }: Create
           </div>
 
           {/* Port + Memory */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <label className="block text-sm font-medium text-surface-300 mb-1.5">
                 Port
@@ -171,7 +171,7 @@ export function CreateServerModal({ open, onClose, onCreate, usedPorts }: Create
           </p>
 
           {/* Submit */}
-          <div className="flex gap-3 pt-2">
+          <div className="flex flex-col-reverse gap-3 pt-2 sm:flex-row">
             <button
               type="button"
               onClick={onClose}

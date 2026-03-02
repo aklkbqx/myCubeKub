@@ -1,13 +1,14 @@
-FROM oven/bun:1-alpine AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1-alpine AS build
 
-WORKDIR /app
-COPY package.json bun.lockb* ./
+WORKDIR /app/apps/web
+COPY apps/web/package.json apps/web/bun.lock* ./
+COPY packages/api-contract /app/packages/api-contract
 RUN bun install --frozen-lockfile
-COPY . .
-RUN bun run build
+COPY apps/web ./
+RUN bunx vite build
 
-FROM nginx:alpine
-COPY --from=build /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+FROM --platform=$TARGETPLATFORM nginx:alpine
+COPY --from=build /app/apps/web/dist /usr/share/nginx/html
+COPY apps/web/nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]

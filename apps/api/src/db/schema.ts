@@ -11,9 +11,7 @@ export const users = pgTable("users", {
 // ─── Sessions ────────────────────────────────────────────────────
 export const sessions = pgTable("sessions", {
   id: uuid("id").defaultRandom().primaryKey(),
-  userId: uuid("user_id")
-    .notNull()
-    .references(() => users.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
@@ -35,14 +33,46 @@ export const servers = pgTable("servers", {
 // ─── Backups ─────────────────────────────────────────────────────
 export const backups = pgTable("backups", {
   id: uuid("id").defaultRandom().primaryKey(),
-  serverId: uuid("server_id")
-    .notNull()
-    .references(() => servers.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
   filename: text("filename").notNull(),
   filePath: text("file_path").notNull(),
   sizeBytes: bigint("size_bytes", { mode: "number" }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   isAuto: boolean("is_auto").default(false),
+});
+
+// ─── Resource Packs ─────────────────────────────────────────────
+export const resourcePacks = pgTable("resource_packs", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  serverId: uuid("server_id").references(() => servers.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  originalFilename: text("original_filename").notNull(),
+  storedFilename: text("stored_filename").notNull(),
+  filePath: text("file_path").notNull(),
+  sha1: text("sha1").notNull(),
+  sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const resourcePackBuilds = pgTable("resource_pack_builds", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  serverId: uuid("server_id").references(() => servers.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  generatedFilename: text("generated_filename").notNull(),
+  filePath: text("file_path").notNull(),
+  publicPath: text("public_path").notNull(),
+  sha1: text("sha1").notNull(),
+  sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+  conflictCount: integer("conflict_count").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const resourcePackBuildItems = pgTable("resource_pack_build_items", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  buildId: uuid("build_id").notNull().references(() => resourcePackBuilds.id, { onDelete: "cascade" }),
+  packId: uuid("pack_id").notNull().references(() => resourcePacks.id, { onDelete: "cascade" }),
+  sortOrder: integer("sort_order").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 // ─── Type exports ────────────────────────────────────────────────
@@ -54,3 +84,9 @@ export type Server = typeof servers.$inferSelect;
 export type NewServer = typeof servers.$inferInsert;
 export type Backup = typeof backups.$inferSelect;
 export type NewBackup = typeof backups.$inferInsert;
+export type ResourcePack = typeof resourcePacks.$inferSelect;
+export type NewResourcePack = typeof resourcePacks.$inferInsert;
+export type ResourcePackBuild = typeof resourcePackBuilds.$inferSelect;
+export type NewResourcePackBuild = typeof resourcePackBuilds.$inferInsert;
+export type ResourcePackBuildItem = typeof resourcePackBuildItems.$inferSelect;
+export type NewResourcePackBuildItem = typeof resourcePackBuildItems.$inferInsert;

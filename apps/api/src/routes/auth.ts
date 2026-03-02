@@ -1,59 +1,30 @@
 import { Elysia, t } from "elysia";
 import { db, schema } from "../db";
-import { eq, and, gt } from "drizzle-orm";
-import bcrypt from "bcryptjs";
+import { eq } from "drizzle-orm";
+import authGuard from "../services/authGuard";
+import { cacheService } from "../services/CacheService";
+import { cacheKeys, getSessionCacheTtl } from "../services/cacheKeys";
 
-/**
- * Session middleware — derives `user` from session cookie
- */
-export const authGuard = new Elysia({ name: "auth-guard" })
-  .derive(
-    { as: "scoped" },
-    async ({ cookie: { session_id }, set }) => {
-      if (!session_id?.value) {
-        set.status = 401;
-        return { user: null };
-      }
+const errorResponse = t.Object({
+  error: t.String(),
+});
 
-      const [sessionRow] = await db
-        .select()
-        .from(schema.sessions)
-        .where(
-          and(
-            eq(schema.sessions.id, session_id.value),
-            gt(schema.sessions.expiresAt, new Date())
-          )
-        )
-        .limit(1);
+const authUserResponse = t.Object({
+  user: t.Object({
+    id: t.String(),
+    username: t.String(),
+  }),
+});
 
-      if (!sessionRow) {
-        set.status = 401;
-        return { user: null };
-      }
+const authMeResponse = t.Object({
+  user: t.Object({
+    id: t.String(),
+    username: t.String(),
+    createdAt: t.String(),
+  }),
+});
 
-      const [user] = await db
-        .select({
-          id: schema.users.id,
-          username: schema.users.username,
-          createdAt: schema.users.createdAt,
-        })
-        .from(schema.users)
-        .where(eq(schema.users.id, sessionRow.userId))
-        .limit(1);
-
-      if (!user) {
-        set.status = 401;
-        return { user: null };
-      }
-
-      return { user };
-    }
-  );
-
-/**
- * Auth routes — login, logout, me
- */
-export const authRoutes = new Elysia({ prefix: "/auth" })
+const authRoutes = new Elysia({ prefix: "/auth" })
   // ─── Login ─────────────────────────────────────────────────
   .post(
     "/login",
@@ -72,8 +43,12 @@ export const authRoutes = new Elysia({ prefix: "/auth" })
         return { error: "Invalid credentials" };
       }
 
-      // Verify password
-      const valid = await bcrypt.compare(password, user.passwordHash);
+      const valid = await Bun.password.verify(
+        password,
+        user.passwordHash,
+        'argon2id'
+      );
+
       if (!valid) {
         set.status = 401;
         return { error: "Invalid credentials" };
@@ -99,6 +74,18 @@ export const authRoutes = new Elysia({ prefix: "/auth" })
         maxAge: 24 * 60 * 60, // 24h
       });
 
+      await cacheService.set(
+        cacheKeys.auth.session(session.id),
+        {
+          user: {
+            id: user.id,
+            username: user.username,
+            createdAt: user.createdAt.toISOString(),
+          },
+        },
+        getSessionCacheTtl(expiresAt)
+      );
+
       return {
         user: {
           id: user.id,
@@ -111,29 +98,68 @@ export const authRoutes = new Elysia({ prefix: "/auth" })
         username: t.String({ minLength: 1 }),
         password: t.String({ minLength: 1 }),
       }),
+      response: {
+        200: authUserResponse,
+        401: errorResponse,
+      },
     }
   )
 
   // ─── Logout ────────────────────────────────────────────────
-  .post("/logout", async ({ cookie: { session_id } }) => {
-    if (session_id?.value) {
-      await db
-        .delete(schema.sessions)
-        .where(eq(schema.sessions.id, session_id.value));
+  .post(
+    "/logout",
+    async ({ cookie: { session_id } }) => {
+      const sessionId =
+        typeof session_id?.value === "string" ? session_id.value : undefined;
 
-      session_id.remove();
+      if (sessionId) {
+        await db
+          .delete(schema.sessions)
+          .where(eq(schema.sessions.id, sessionId));
+
+        await cacheService.del(cacheKeys.auth.session(sessionId));
+        session_id.remove();
+      }
+
+      return { success: true };
+    },
+    {
+      response: t.Object({
+        success: t.Boolean(),
+      }),
     }
-
-    return { success: true };
-  })
+  )
 
   // ─── Me (get current user) ────────────────────────────────
   .use(authGuard)
-  .get("/me", ({ user, set }) => {
-    if (!user) {
-      set.status = 401;
-      return { error: "Not authenticated" };
-    }
+  .get(
+    "/me",
+    ({ user, authUnavailable, set }) => {
+      if (authUnavailable) {
+        set.status = 503;
+        return { error: "Authentication schema is not ready. Run database migrations first." };
+      }
 
-    return { user };
-  });
+      if (!user) {
+        set.status = 401;
+        return { error: "Not authenticated" };
+      }
+
+      return {
+        user: {
+          ...user,
+          createdAt: user.createdAt.toISOString(),
+        },
+      };
+    },
+    {
+      response: {
+        200: authMeResponse,
+        401: errorResponse,
+        503: errorResponse,
+      },
+    }
+  );
+
+
+export default authRoutes

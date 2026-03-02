@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef, type ChangeEvent, type DragEvent } from "react";
+import { createPortal } from "react-dom";
 import { api, type FileInfo } from "@/lib/api";
 import { formatBytes } from "@/lib/utils";
 import {
-    Folder, File, ArrowLeft, Plus, Trash2, Download, Upload,
-    FolderPlus, Edit3, X, Check,
+    Folder, File, ArrowLeft, Trash2, Download, Upload,
+    FolderPlus, Edit3, X, Check, Inbox, Archive,
 } from "lucide-react";
 import { LoadingOverlay } from "./LoadingOverlay";
 
@@ -12,32 +13,73 @@ interface FileBrowserProps {
     onEditFile: (path: string) => void;
 }
 
+type FileDeleteConfirmState =
+    | { kind: "single"; item: FileInfo }
+    | { kind: "bulk"; items: FileInfo[] };
+
 export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
     const [currentPath, setCurrentPath] = useState("");
     const [files, setFiles] = useState<FileInfo[]>([]);
     const [loading, setLoading] = useState(true);
+    const [refreshing, setRefreshing] = useState(false);
     const [showNewFolder, setShowNewFolder] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
     const [renamingFile, setRenamingFile] = useState<string | null>(null);
     const [renameValue, setRenameValue] = useState("");
     const [error, setError] = useState("");
+    const [uploading, setUploading] = useState(false);
+    const [downloading, setDownloading] = useState(false);
+    const [dragActive, setDragActive] = useState(false);
+    const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+    const [deleteConfirm, setDeleteConfirm] = useState<FileDeleteConfirmState | null>(null);
+    const [previewImage, setPreviewImage] = useState<FileInfo | null>(null);
+    const dragDepthRef = useRef(0);
+    const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-    const fetchFiles = useCallback(async () => {
-        setLoading(true);
+    const normalizedCurrentPath =
+        currentPath && currentPath !== "undefined" && currentPath !== "null"
+            ? currentPath
+            : "";
+
+    const fetchFiles = useCallback(async (options?: { silent?: boolean }) => {
+        const silent = options?.silent ?? false;
+
+        if (silent) {
+            setRefreshing(true);
+        } else {
+            setLoading(true);
+        }
         setError("");
         try {
-            const res = await api.files.list(serverId, currentPath || undefined);
+            const res = await api.files.list(serverId, normalizedCurrentPath || undefined);
             setFiles(res.files);
+            setCurrentPath(res.path && res.path !== "undefined" && res.path !== "null" ? res.path : "");
+            setSelectedPaths((prev) =>
+                prev.filter((path) => res.files.some((file) => file.path === path))
+            );
         } catch (err) {
             setError("Failed to load files.");
             setFiles([]);
+            setSelectedPaths([]);
         } finally {
-            setLoading(false);
+            if (silent) {
+                setRefreshing(false);
+            } else {
+                setLoading(false);
+            }
         }
-    }, [serverId, currentPath]);
+    }, [serverId, normalizedCurrentPath]);
 
     useEffect(() => {
-        fetchFiles();
+        void fetchFiles();
+    }, [fetchFiles]);
+
+    useEffect(() => {
+        const interval = setInterval(() => {
+            void fetchFiles({ silent: true });
+        }, 5_000);
+
+        return () => clearInterval(interval);
     }, [fetchFiles]);
 
     const navigateToFolder = (path: string) => {
@@ -45,34 +87,30 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
     };
 
     const navigateUp = () => {
-        const parts = currentPath.split("/").filter(Boolean);
+        const parts = normalizedCurrentPath.split("/").filter(Boolean);
         parts.pop();
         setCurrentPath(parts.join("/"));
     };
 
     const handleCreateFolder = async () => {
         if (!newFolderName.trim()) return;
-        const path = currentPath ? `${currentPath}/${newFolderName}` : newFolderName;
+        const path = normalizedCurrentPath ? `${normalizedCurrentPath}/${newFolderName}` : newFolderName;
         setError("");
         try {
             await api.files.mkdir(serverId, path);
             setNewFolderName("");
             setShowNewFolder(false);
-            fetchFiles();
+            void fetchFiles();
         } catch (err: any) {
             setError(err.message || "Failed to create folder.");
         }
     };
 
-    const handleDelete = async (file: FileInfo) => {
-        const confirmed = window.confirm(
-            `Delete ${file.isDirectory ? "folder" : "file"} "${file.name}"?`
-        );
-        if (!confirmed) return;
+    const executeDelete = async (file: FileInfo) => {
         setError("");
         try {
             await api.files.delete(serverId, file.path);
-            fetchFiles();
+            void fetchFiles();
         } catch (err: any) {
             setError(err.message || "Failed to delete item.");
         }
@@ -89,47 +127,184 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
         try {
             await api.files.rename(serverId, file.path, newPath);
             setRenamingFile(null);
-            fetchFiles();
+            void fetchFiles();
         } catch (err: any) {
             setError(err.message || "Failed to rename item.");
         }
     };
 
-    const handleUpload = async () => {
-        const input = document.createElement("input");
-        input.type = "file";
-        input.onchange = async (e) => {
-            const file = (e.target as HTMLInputElement).files?.[0];
-            if (!file) return;
-            const formData = new FormData();
-            formData.append("file", file);
-            if (currentPath) formData.append("path", currentPath);
+    const uploadFiles = useCallback(async (fileList: FileList | File[]) => {
+        const items = Array.from(fileList);
+        if (items.length === 0) return;
 
-            setError("");
-            const res = await fetch(`/api/servers/${serverId}/files/upload`, {
-                method: "POST",
-                credentials: "include",
-                body: formData,
-            });
-            if (!res.ok) {
-                const data = await res.json().catch(() => ({}));
-                setError(data.error || "Failed to upload file.");
-                return;
-            }
-            fetchFiles();
-        };
-        input.click();
+        setUploading(true);
+        setError("");
+
+        try {
+            await Promise.all(
+                items.map((file) => api.files.upload(serverId, file, normalizedCurrentPath || undefined))
+            );
+            await fetchFiles();
+        } catch (err: any) {
+            setError(err.message || "Failed to upload file.");
+        } finally {
+            setUploading(false);
+        }
+    }, [normalizedCurrentPath, fetchFiles, serverId]);
+
+    const handleUpload = async () => {
+        fileInputRef.current?.click();
+    };
+
+    const handleFileSelection = async (e: ChangeEvent<HTMLInputElement>) => {
+        const selectedFiles = e.target.files;
+        if (!selectedFiles?.length) return;
+
+        await uploadFiles(selectedFiles);
+        e.target.value = "";
+    };
+
+    const handleDragEnter = (e: DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragDepthRef.current += 1;
+        setDragActive(true);
+    };
+
+    const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!dragActive) {
+            setDragActive(true);
+        }
+    };
+
+    const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+        if (dragDepthRef.current === 0) {
+            setDragActive(false);
+        }
+    };
+
+    const handleDrop = async (e: DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragDepthRef.current = 0;
+        setDragActive(false);
+
+        const droppedFiles = e.dataTransfer.files;
+        if (!droppedFiles?.length) return;
+
+        await uploadFiles(droppedFiles);
     };
 
     const handleFileClick = (file: FileInfo) => {
         if (file.isDirectory) {
             navigateToFolder(file.path);
-        } else {
+        } else if (isTextFile(file.name)) {
             onEditFile(file.path);
+        } else if (isImageFile(file.name)) {
+            setPreviewImage(file);
         }
     };
 
-    const breadcrumbs = currentPath ? currentPath.split("/").filter(Boolean) : [];
+    const toggleSelection = (file: FileInfo) => {
+        setSelectedPaths((prev) =>
+            prev.includes(file.path)
+                ? prev.filter((path) => path !== file.path)
+                : [...prev, file.path]
+        );
+    };
+
+    const selectableItems = files;
+    const hasSelectableItems = selectableItems.length > 0;
+    const visibleSelectedItems = selectableItems.filter((file) => selectedPaths.includes(file.path));
+    const allFilesSelected =
+        hasSelectableItems &&
+        selectableItems.every((file) => selectedPaths.includes(file.path));
+
+    const toggleSelectAll = () => {
+        setSelectedPaths(allFilesSelected ? [] : selectableItems.map((file) => file.path));
+    };
+
+    const triggerDownload = (path: string) => {
+        const anchor = document.createElement("a");
+        anchor.href = api.files.downloadUrl(serverId, path);
+        anchor.download = path.split("/").pop() || "download";
+        anchor.rel = "noopener";
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+    };
+
+    const handleDownloadSelected = async () => {
+        if (visibleSelectedItems.length === 0) return;
+
+        setDownloading(true);
+        setError("");
+
+        try {
+            for (const file of visibleSelectedItems) {
+                triggerDownload(file.path);
+                await new Promise((resolve) => setTimeout(resolve, 150));
+            }
+        } catch (err: any) {
+            setError(err.message || "Failed to download selected files.");
+        } finally {
+            setDownloading(false);
+        }
+    };
+
+    const executeDeleteSelected = async (items: FileInfo[]) => {
+        if (items.length === 0) return;
+        setError("");
+        setDownloading(true);
+
+        try {
+            await Promise.all(
+                items.map((file) => api.files.delete(serverId, file.path))
+            );
+            setSelectedPaths([]);
+            await fetchFiles();
+        } catch (err: any) {
+            setError(err.message || "Failed to delete selected items.");
+        } finally {
+            setDownloading(false);
+        }
+    };
+
+    const handleDeleteSelected = async () => {
+        if (visibleSelectedItems.length === 0) return;
+        setDeleteConfirm({ kind: "bulk", items: visibleSelectedItems });
+    };
+
+    const handleConfirmDelete = async () => {
+        if (!deleteConfirm) return;
+
+        const confirmState = deleteConfirm;
+        setDeleteConfirm(null);
+
+        if (confirmState.kind === "single") {
+            await executeDelete(confirmState.item);
+            return;
+        }
+
+        await executeDeleteSelected(confirmState.items);
+    };
+
+    const handleDownloadAll = () => {
+        const anchor = document.createElement("a");
+        anchor.href = api.files.downloadAllUrl(serverId);
+        anchor.download = "server-data.tar.gz";
+        anchor.rel = "noopener";
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+    };
+
+    const breadcrumbs = normalizedCurrentPath ? normalizedCurrentPath.split("/").filter(Boolean) : [];
 
     const isTextFile = (name: string) => {
         const ext = name.split(".").pop()?.toLowerCase() || "";
@@ -141,17 +316,53 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
         return textExts.includes(ext);
     };
 
+    const isImageFile = (name: string) => {
+        const ext = name.split(".").pop()?.toLowerCase() || "";
+        const imageExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"];
+        return imageExts.includes(ext);
+    };
+
     return (
-        <div className="relative">
-            {loading && <LoadingOverlay message="Loading files" subtle />}
+        <div
+            className={`relative transition-all duration-200 ${dragActive ? "scale-[1.01]" : ""}`}
+            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+        >
+            {(loading || uploading || downloading) && (
+                <LoadingOverlay
+                    message={
+                        uploading
+                            ? "Uploading files"
+                            : downloading
+                                ? "Preparing downloads"
+                                : "Loading files"
+                    }
+                    subtle
+                />
+            )}
+
+            {!loading && refreshing && !uploading && !downloading && (
+                <div className="pointer-events-none absolute right-4 top-4 z-20 rounded-full border border-surface-700/70 bg-surface-900/80 px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] text-surface-400 backdrop-blur-md">
+                    Refreshing
+                </div>
+            )}
+            <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={handleFileSelection}
+            />
             {error && (
                 <div className="mb-4 rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-300">
                     {error}
                 </div>
             )}
             {/* Toolbar */}
-            <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2 text-sm">
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap items-center gap-2 text-sm">
                     <button
                         onClick={() => setCurrentPath("")}
                         className="text-brand-400 hover:text-brand-300 font-medium"
@@ -173,7 +384,23 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                     ))}
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex items-center justify-end gap-2">
+                    <button
+                        onClick={handleDownloadAll}
+                        disabled={downloading || uploading}
+                        className="btn-icon text-surface-400 hover:text-surface-200 disabled:cursor-not-allowed disabled:opacity-40"
+                        title="Download entire data folder"
+                    >
+                        <Archive size={16} />
+                    </button>
+                    <button
+                        onClick={handleDownloadSelected}
+                        disabled={selectedPaths.length === 0 || downloading}
+                        className="btn-icon text-surface-400 hover:text-surface-200 disabled:cursor-not-allowed disabled:opacity-40"
+                        title="Download selected"
+                    >
+                        <Download size={16} />
+                    </button>
                     <button onClick={handleUpload} className="btn-icon text-surface-400 hover:text-surface-200" title="Upload">
                         <Upload size={16} />
                     </button>
@@ -219,100 +446,268 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                 </button>
             )}
 
-            {/* File list */}
-            {!loading && files.length === 0 ? (
-                <div className="text-center py-8 text-surface-500 text-sm">
-                    <Folder size={32} className="mx-auto mb-2 opacity-50" />
-                    <p>Empty directory</p>
-                </div>
-            ) : (
-                <div className="space-y-0.5 grid grid-cols-1">
-                    {files.map((file) => (
-                        <div
-                            key={file.path}
-                            className="items-center gap-3 px-2 py-2 rounded-lg hover:bg-surface-800/50 group cursor-pointer transition-colors grid grid-cols-[1fr_80px_110px]"
-                            onClick={() => handleFileClick(file)}
+            {hasSelectableItems && visibleSelectedItems.length > 0 && (
+                <div className="mb-3 flex items-center justify-between rounded-2xl border border-brand-500/15 bg-surface-900/65 px-4 py-3 text-xs text-surface-300 shadow-lg shadow-black/10">
+                    <label className="flex items-center gap-3">
+                        <button
+                            type="button"
+                            aria-label="Select all items"
+                            onClick={toggleSelectAll}
+                            className={`flex h-5 w-5 items-center justify-center rounded-md border transition-colors ${
+                                allFilesSelected
+                                    ? "border-brand-400 bg-brand-500/20 text-brand-200"
+                                    : "border-surface-700 bg-surface-900/70 text-transparent hover:border-brand-500/40"
+                            }`}
                         >
-                            <div className="items-center flex gap-2 flex-1 w-full">
-                                {file.isDirectory ? (
-                                    <Folder size={16} className="text-brand-400 flex-shrink-0" />
-                                ) : (
-                                    <File size={16} className="text-surface-500 flex-shrink-0" />
-                                )}
+                            <Check size={12} />
+                        </button>
+                        <span className="inline-flex items-center gap-2">
+                            <span className="rounded-full border border-brand-500/20 bg-brand-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-brand-300">
+                                Selection
+                            </span>
+                            {visibleSelectedItems.length > 0
+                                ? `${visibleSelectedItems.length} item${visibleSelectedItems.length > 1 ? "s" : ""} selected`
+                                : "Select files or folders to download"}
+                        </span>
+                    </label>
+                    {visibleSelectedItems.length > 0 && (
+                        <div className="flex items-center gap-2">
+                            <button
+                                type="button"
+                                onClick={handleDeleteSelected}
+                                className="inline-flex items-center gap-1 rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-1.5 text-[11px] font-medium text-red-300 transition-colors hover:border-red-400/30 hover:bg-red-500/15 hover:text-red-200"
+                            >
+                                <Trash2 size={12} />
+                                Delete selected
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setSelectedPaths([])}
+                                className="text-surface-500 transition-colors hover:text-surface-200"
+                            >
+                                Clear
+                            </button>
+                        </div>
+                    )}
+                </div>
+            )}
 
-                                {renamingFile === file.path ? (
-                                    <input
-                                        type="text"
-                                        value={renameValue}
-                                        onChange={(e) => setRenameValue(e.target.value)}
-                                        className="input-field flex-1 text-sm py-1"
-                                        autoFocus
-                                        onClick={(e) => e.stopPropagation()}
-                                        onKeyDown={(e) => {
-                                            if (e.key === "Enter") handleRename(file);
-                                            if (e.key === "Escape") setRenamingFile(null);
-                                        }}
-                                        onBlur={() => handleRename(file)}
-                                    />
-                                ) : (
-                                    <span className="flex-1 text-sm text-surface-200 truncate">
-                                        {file.name}
-                                    </span>
-                                )}
-                            </div>
+            {dragActive && (
+                <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-brand-400/60 bg-brand-500/10 backdrop-blur-sm">
+                    <div className="flex flex-col items-center gap-2 rounded-2xl border border-brand-400/30 bg-surface-950/85 px-6 py-5 text-center shadow-2xl shadow-brand-900/20">
+                        <Inbox size={24} className="text-brand-300" />
+                        <div>
+                            <p className="text-sm font-medium text-surface-50">Drop files to upload here</p>
+                            <p className="text-xs text-surface-400">Files will be uploaded into {normalizedCurrentPath || "data/"}</p>
+                        </div>
+                    </div>
+                </div>
+            )}
 
-                            <div className="h-full">
-                                {!file.isDirectory && (
-                                    <span className="text-xs text-surface-600">
-                                        {formatBytes(file.size)}
-                                    </span>
-                                )}
-                            </div>
-
-                            {/* Actions */}
-                            <div className="justify-center flex">
-                                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
+            <div className={`rounded-2xl border transition-colors duration-200 ${dragActive ? "border-brand-400/50 bg-brand-500/5" : "border-transparent"}`}>
+                {/* File list */}
+                {!loading && files.length === 0 ? (
+                    <button
+                        type="button"
+                        onClick={handleUpload}
+                        className="flex w-full flex-col items-center justify-center rounded-2xl border border-dashed border-surface-700/80 bg-surface-900/40 px-6 py-10 text-center text-sm text-surface-500 transition-colors hover:border-brand-500/40 hover:bg-surface-900/70 hover:text-surface-300"
+                    >
+                        <Folder size={32} className="mx-auto mb-2 opacity-50" />
+                        <p>Empty directory</p>
+                        <p className="mt-2 text-xs text-surface-600">Click to upload or drag and drop files here</p>
+                    </button>
+                ) : (
+                    <div className="space-y-0.5 grid grid-cols-1">
+                        {files.map((file) => (
+                            <div
+                                key={file.path}
+                                className={`grid cursor-pointer grid-cols-[minmax(0,1fr)_auto] gap-2 rounded-xl px-2 py-3 transition-colors group sm:grid-cols-[minmax(0,1fr)_80px_110px] sm:items-center ${selectedPaths.includes(file.path)
+                                    ? "border border-brand-500/25 bg-brand-500/10"
+                                    : "border border-transparent hover:bg-surface-800/50"
+                                    }`}
+                                onClick={() => handleFileClick(file)}
+                            >
+                                <div className="items-center flex gap-2 flex-1 w-full">
                                     <button
-                                        onClick={() => {
-                                            setRenamingFile(file.path);
-                                            setRenameValue(file.name);
+                                        type="button"
+                                        aria-label={`Select ${file.name}`}
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            toggleSelection(file);
                                         }}
-                                        className="btn-icon text-surface-500 hover:text-surface-300 p-1"
-                                        title="Rename"
+                                        className={`flex h-5 w-5 items-center justify-center rounded-md border transition-colors ${selectedPaths.includes(file.path) ? "border-brand-400 bg-brand-500/20 text-brand-200" : "border-surface-700 bg-surface-900/70 text-transparent hover:border-brand-500/40"}`}
                                     >
-                                        <Edit3 size={12} />
+                                        <Check size={12} />
                                     </button>
-                                    {!file.isDirectory && isTextFile(file.name) && (
+                                    {file.isDirectory ? (
+                                        <Folder size={16} className="text-brand-400 flex-shrink-0" />
+                                    ) : (
+                                        <File size={16} className="text-surface-500 flex-shrink-0" />
+                                    )}
+
+                                    {renamingFile === file.path ? (
+                                        <input
+                                            type="text"
+                                            value={renameValue}
+                                            onChange={(e) => setRenameValue(e.target.value)}
+                                            className="input-field flex-1 text-sm py-1"
+                                            autoFocus
+                                            onClick={(e) => e.stopPropagation()}
+                                            onKeyDown={(e) => {
+                                                if (e.key === "Enter") handleRename(file);
+                                                if (e.key === "Escape") setRenamingFile(null);
+                                            }}
+                                            onBlur={() => handleRename(file)}
+                                        />
+                                    ) : (
+                                        <span className="flex-1 text-sm text-surface-200 truncate">
+                                            {file.name}
+                                        </span>
+                                    )}
+                                </div>
+
+                                <div className="hidden h-full sm:block">
+                                    {!file.isDirectory && (
+                                        <span className="text-xs text-surface-600">
+                                            {formatBytes(file.size)}
+                                        </span>
+                                    )}
+                                </div>
+
+                                {/* Actions */}
+                                <div className="col-span-2 flex justify-end sm:col-span-1 sm:justify-center">
+                                    <div className="flex items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100" onClick={(e) => e.stopPropagation()}>
                                         <button
-                                            onClick={() => onEditFile(file.path)}
+                                            onClick={() => {
+                                                setRenamingFile(file.path);
+                                                setRenameValue(file.name);
+                                            }}
                                             className="btn-icon text-surface-500 hover:text-surface-300 p-1"
-                                            title="Edit"
+                                            title="Rename"
                                         >
                                             <Edit3 size={12} />
                                         </button>
-                                    )}
-                                    {!file.isDirectory && (
-                                        <a
-                                            href={api.files.downloadUrl(serverId, file.path)}
-                                            className="btn-icon text-surface-500 hover:text-surface-300 p-1"
-                                            title="Download"
-                                            onClick={(e) => e.stopPropagation()}
+                                        {!file.isDirectory && isTextFile(file.name) && (
+                                            <button
+                                                onClick={() => onEditFile(file.path)}
+                                                className="btn-icon text-surface-500 hover:text-surface-300 p-1"
+                                                title="Edit"
+                                            >
+                                                <Edit3 size={12} />
+                                            </button>
+                                        )}
+                                        {!file.isDirectory && (
+                                            <a
+                                                href={api.files.downloadUrl(serverId, file.path)}
+                                                className="btn-icon text-surface-500 hover:text-surface-300 p-1"
+                                                title="Download"
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
+                                                <Download size={12} />
+                                            </a>
+                                        )}
+                                        <button
+                                            onClick={() => setDeleteConfirm({ kind: "single", item: file })}
+                                            className="btn-icon text-surface-500 hover:text-red-400 p-1"
+                                            title="Delete"
                                         >
-                                            <Download size={12} />
-                                        </a>
-                                    )}
-                                    <button
-                                        onClick={() => handleDelete(file)}
-                                        className="btn-icon text-surface-500 hover:text-red-400 p-1"
-                                        title="Delete"
-                                    >
-                                        <Trash2 size={12} />
-                                    </button>
+                                            <Trash2 size={12} />
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+
+            {deleteConfirm && createPortal(
+                <div className="fixed inset-0 z-[70] flex items-center justify-center bg-surface-950/75 px-4 backdrop-blur-sm">
+                    <div className="w-full max-w-md rounded-2xl border border-surface-700/70 bg-surface-900 p-6 shadow-2xl shadow-black/40">
+                        <h3 className="text-lg font-semibold text-surface-100">
+                            {deleteConfirm.kind === "single" ? "Delete item?" : "Delete selected items?"}
+                        </h3>
+                        <p className="mt-2 text-sm leading-6 text-surface-400">
+                            {deleteConfirm.kind === "single"
+                                ? `This will delete ${deleteConfirm.item.isDirectory ? "folder" : "file"} "${deleteConfirm.item.name}".`
+                                : `This will delete ${deleteConfirm.items.length} selected item${deleteConfirm.items.length > 1 ? "s" : ""}.`}
+                        </p>
+                        {deleteConfirm.kind === "bulk" && (
+                            <div className="mt-4 max-h-48 overflow-y-auto rounded-xl border border-surface-800 bg-surface-950/60 p-3 text-xs text-surface-300">
+                                <div className="space-y-2">
+                                    {deleteConfirm.items.slice(0, 5).map((item) => (
+                                        <div key={item.path}>
+                                            {item.name}
+                                            {item.isDirectory ? " (folder, deletes contents)" : ""}
+                                        </div>
+                                    ))}
+                                    {deleteConfirm.items.length > 5 && (
+                                        <div className="text-surface-500">
+                                            ...and {deleteConfirm.items.length - 5} more item{deleteConfirm.items.length - 5 > 1 ? "s" : ""}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                        <div className="mt-6 flex items-center justify-end gap-3">
+                            <button
+                                type="button"
+                                onClick={() => setDeleteConfirm(null)}
+                                className="btn-secondary"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => void handleConfirmDelete()}
+                                className="btn-danger"
+                            >
+                                Confirm
+                            </button>
                         </div>
-                    ))}
-                </div>
+                    </div>
+                </div>,
+                document.body
+            )}
+
+            {previewImage && createPortal(
+                <div
+                    className="fixed inset-0 z-[75] flex items-center justify-center bg-surface-950/85 px-4 py-6 backdrop-blur-sm"
+                    onClick={() => setPreviewImage(null)}
+                >
+                    <div
+                        className="w-full max-w-5xl rounded-2xl border border-surface-700/70 bg-surface-900 p-4 shadow-2xl shadow-black/40"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="mb-4 flex items-start justify-between gap-4">
+                            <div className="min-w-0">
+                                <h3 className="truncate text-lg font-semibold text-surface-100">
+                                    {previewImage.name}
+                                </h3>
+                                <p className="mt-1 text-xs text-surface-400">
+                                    {formatBytes(previewImage.size)}
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setPreviewImage(null)}
+                                className="btn-icon text-surface-400 hover:text-surface-100"
+                                aria-label="Close image preview"
+                            >
+                                <X size={16} />
+                            </button>
+                        </div>
+
+                        <div className="flex max-h-[75vh] items-center justify-center overflow-auto rounded-2xl border border-surface-800 bg-surface-950/70 p-3">
+                            <img
+                                src={api.files.downloadUrl(serverId, previewImage.path)}
+                                alt={previewImage.name}
+                                className="max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
+                            />
+                        </div>
+                    </div>
+                </div>,
+                document.body
             )}
         </div>
     );

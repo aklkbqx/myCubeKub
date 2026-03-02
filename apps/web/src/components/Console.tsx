@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Send, Trash2 } from "lucide-react";
+import { api, type ConsoleEvent, type ConsoleCommandMessage } from "@/lib/api";
 
 interface ConsoleProps {
     serverId: string;
 }
 
 interface LogEntry {
-    type: "log" | "error" | "info" | "command" | "command_result";
+    type: ConsoleEvent["type"] | "command";
     data: string;
     timestamp?: string;
     command?: string;
@@ -18,9 +19,14 @@ export function Console({ serverId }: ConsoleProps) {
     const [connected, setConnected] = useState(false);
     const [commandHistory, setCommandHistory] = useState<string[]>([]);
     const [historyIndex, setHistoryIndex] = useState(-1);
-    const wsRef = useRef<WebSocket | null>(null);
+    const [consoleHeight, setConsoleHeight] = useState(500);
+    const wsRef = useRef<ReturnType<typeof api.console.connect> | null>(null);
     const logsEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
+    const isResizingRef = useRef(false);
+
+    const CONSOLE_MIN_HEIGHT = 320;
+    const CONSOLE_MAX_HEIGHT_OFFSET = 180;
 
     const scrollToBottom = useCallback(() => {
         logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -31,48 +37,66 @@ export function Console({ serverId }: ConsoleProps) {
     }, [logs, scrollToBottom]);
 
     useEffect(() => {
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/api/servers/${serverId}/console`;
-
-        const ws = new WebSocket(wsUrl);
+        const ws = api.console.connect(serverId);
         wsRef.current = ws;
 
-        ws.onopen = () => {
+        ws.on("open", () => {
             setConnected(true);
             setLogs((prev) => [...prev, { type: "info", data: "Connected to server console" }]);
-        };
+        });
 
-        ws.onmessage = (event) => {
-            try {
-                const msg = JSON.parse(event.data) as LogEntry;
-                setLogs((prev) => {
-                    const next = [...prev, msg];
-                    // Keep last 1000 lines
-                    return next.length > 1000 ? next.slice(-1000) : next;
-                });
-            } catch {
-                setLogs((prev) => [...prev, { type: "log", data: event.data }]);
-            }
-        };
+        ws.subscribe((event) => {
+            const msg = event.data as ConsoleEvent;
+            setLogs((prev) => {
+                const next = [...prev, msg];
+                return next.length > 1000 ? next.slice(-1000) : next;
+            });
+        });
 
-        ws.onerror = () => {
+        ws.on("error", () => {
             setLogs((prev) => [...prev, { type: "error", data: "WebSocket error" }]);
-        };
+        });
 
-        ws.onclose = () => {
+        ws.on("close", () => {
             setConnected(false);
             setLogs((prev) => [...prev, { type: "info", data: "Disconnected from server console" }]);
-        };
+        });
 
         return () => {
             ws.close();
         };
     }, [serverId]);
 
-    const sendCommand = () => {
-        if (!command.trim() || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    useEffect(() => {
+        const handlePointerMove = (event: PointerEvent) => {
+            if (!isResizingRef.current) return;
 
-        wsRef.current.send(JSON.stringify({ type: "command", command: command.trim() }));
+            const maxHeight = Math.max(CONSOLE_MIN_HEIGHT, window.innerHeight - CONSOLE_MAX_HEIGHT_OFFSET);
+            const nextHeight = Math.min(maxHeight, Math.max(CONSOLE_MIN_HEIGHT, window.innerHeight - event.clientY - 40));
+            setConsoleHeight(nextHeight);
+        };
+
+        const handlePointerUp = () => {
+            isResizingRef.current = false;
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+        };
+
+        window.addEventListener("pointermove", handlePointerMove);
+        window.addEventListener("pointerup", handlePointerUp);
+        window.addEventListener("pointercancel", handlePointerUp);
+
+        return () => {
+            window.removeEventListener("pointermove", handlePointerMove);
+            window.removeEventListener("pointerup", handlePointerUp);
+            window.removeEventListener("pointercancel", handlePointerUp);
+        };
+    }, []);
+
+    const sendCommand = () => {
+        if (!command.trim() || !wsRef.current || wsRef.current.ws.readyState !== WebSocket.OPEN) return;
+
+        wsRef.current.send({ type: "command", command: command.trim() } satisfies ConsoleCommandMessage);
         setLogs((prev) => [
             ...prev,
             { type: "command", data: command.trim(), timestamp: new Date().toISOString() },
@@ -121,10 +145,29 @@ export function Console({ serverId }: ConsoleProps) {
         }
     };
 
+    const startResize = (event: React.PointerEvent<HTMLButtonElement>) => {
+        event.preventDefault();
+        isResizingRef.current = true;
+        document.body.style.cursor = "ns-resize";
+        document.body.style.userSelect = "none";
+    };
+
     return (
-        <div className="flex flex-col h-[500px]">
+        <div
+            className="flex flex-col overflow-hidden rounded-lg border border-surface-700/50 bg-surface-900/40"
+            style={{ height: `${consoleHeight}px` }}
+        >
+            <button
+                type="button"
+                onPointerDown={startResize}
+                className="group flex h-5 items-center justify-center border-b border-surface-700/50 bg-surface-900/80 text-surface-500 transition-colors hover:bg-surface-800 hover:text-surface-300"
+                aria-label="Resize console"
+                title="Drag to resize console"
+            >
+                <span className="h-1 w-12 rounded-full bg-current/60 transition-colors group-hover:bg-current" />
+            </button>
             {/* Log area */}
-            <div className="flex-1 bg-surface-900 rounded-t-lg overflow-y-auto p-3 font-mono text-xs leading-relaxed custom-scrollbar">
+            <div className="flex-1 overflow-y-auto bg-surface-900 p-3 font-mono text-xs leading-relaxed custom-scrollbar">
                 {logs.length === 0 && (
                     <div className="text-surface-600 text-center py-8">
                         {connected ? "Waiting for logs..." : "Connecting to server..."}
@@ -145,7 +188,7 @@ export function Console({ serverId }: ConsoleProps) {
             </div>
 
             {/* Input area */}
-            <div className="flex items-center gap-2 bg-surface-800 rounded-b-lg px-3 py-2 border-t border-surface-700/50">
+            <div className="flex flex-wrap items-center gap-2 border-t border-surface-700/50 bg-surface-800 px-3 py-2">
                 <span className="text-surface-600 text-xs font-mono">&gt;</span>
                 <input
                     ref={inputRef}
@@ -155,7 +198,7 @@ export function Console({ serverId }: ConsoleProps) {
                     onKeyDown={handleKeyDown}
                     placeholder={connected ? "Enter RCON command..." : "Not connected"}
                     disabled={!connected}
-                    className="flex-1 bg-transparent text-surface-200 font-mono text-sm placeholder:text-surface-600 focus:outline-none disabled:opacity-50"
+                    className="min-w-[180px] flex-1 bg-transparent text-sm font-mono text-surface-200 placeholder:text-surface-600 focus:outline-none disabled:opacity-50"
                 />
                 <div className="flex items-center gap-1">
                     <button

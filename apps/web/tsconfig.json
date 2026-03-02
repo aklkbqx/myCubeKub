@@ -12,7 +12,9 @@
     "jsx": "react-jsx",
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@mycubekub/api-contract": ["../../packages/api-contract/src/index.ts"],
+      "elysia": ["../../apps/api/node_modules/elysia"]
     },
     "types": ["vite/client"]
   },

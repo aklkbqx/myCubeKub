@@ -59,15 +59,15 @@ export function FileEditor({ serverId, filePath, onClose }: FileEditorProps) {
                 />
             )}
             {/* Header */}
-            <div className="flex items-center justify-between py-3 px-4 border-b border-surface-700/50">
-                <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-surface-200">{fileName}</span>
-                    <span className="text-xs text-surface-600">{filePath}</span>
+            <div className="flex flex-col gap-3 border-b border-surface-700/50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0 flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+                    <span className="truncate text-sm font-medium text-surface-200">{fileName}</span>
+                    <span className="truncate text-xs text-surface-600">{filePath}</span>
                     {hasChanges && (
                         <span className="text-xs text-amber-400">● unsaved</span>
                     )}
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center justify-end gap-2">
                     <button
                         onClick={handleSave}
                         disabled={saving || !hasChanges}
@@ -87,7 +87,7 @@ export function FileEditor({ serverId, filePath, onClose }: FileEditorProps) {
                 <textarea
                     value={content}
                     onChange={(e) => setContent(e.target.value)}
-                    className="flex-1 w-full bg-surface-900 text-surface-200 font-mono text-sm p-4 resize-none focus:outline-none leading-relaxed"
+                    className="flex-1 w-full bg-surface-900 p-3 text-sm leading-relaxed text-surface-200 resize-none focus:outline-none sm:p-4"
                     spellCheck={false}
                     onKeyDown={(e) => {
                         // Ctrl/Cmd + S to save
