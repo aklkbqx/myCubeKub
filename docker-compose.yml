@@ -9,7 +9,7 @@ services:
       - DATABASE_URL=postgresql://mycubekub:mycubekub@db:5432/mycubekub
       - SERVERS_DIR=/app/servers
     ports:
-      - "3000:3000"
+      - "3002:3000"
     depends_on:
       db:
         condition: service_healthy
