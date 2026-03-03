@@ -1,5 +1,6 @@
 import { mkdir, writeFile, rm } from "fs/promises";
-import { join, resolve } from "path";
+import { randomBytes } from "crypto";
+import { dirname, join, resolve } from "path";
 import { existsSync } from "fs";
 import { fileURLToPath } from "url";
 
@@ -112,8 +113,9 @@ export async function deleteServerFiles(serverId: string): Promise<void> {
 /**
  * Read server.properties from a server's data directory
  */
-export async function readServerProperties(serverId: string): Promise<Record<string, string>> {
+export async function readServerProperties(serverId: string): Promise<{ properties: Record<string, string>; exists: boolean }> {
   const propsPath = join(getServerDir(serverId), "data", "server.properties");
+  const exists = existsSync(propsPath);
 
   try {
     const content = await Bun.file(propsPath).text();
@@ -129,9 +131,15 @@ export async function readServerProperties(serverId: string): Promise<Record<str
       props[key] = value;
     }
 
-    return props;
+    return {
+      properties: props,
+      exists,
+    };
   } catch {
-    return {};
+    return {
+      properties: {},
+      exists,
+    };
   }
 }
 
@@ -143,6 +151,7 @@ export async function writeServerProperties(
   properties: Record<string, string>
 ): Promise<void> {
   const propsPath = join(getServerDir(serverId), "data", "server.properties");
+  await mkdir(dirname(propsPath), { recursive: true });
 
   // Read existing content to preserve comments and ordering
   let existingLines: string[] = [];
@@ -184,6 +193,104 @@ export async function writeServerProperties(
   }
 
   await writeFile(propsPath, outputLines.join("\n"), "utf-8");
+}
+
+function formatPropertiesTimestamp(date = new Date()) {
+  const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const day = weekdays[date.getUTCDay()];
+  const month = months[date.getUTCMonth()];
+  const dayOfMonth = String(date.getUTCDate()).padStart(2, "0");
+  const hours = String(date.getUTCHours()).padStart(2, "0");
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+  const seconds = String(date.getUTCSeconds()).padStart(2, "0");
+  const year = date.getUTCFullYear();
+
+  return `${day} ${month} ${dayOfMonth} ${hours}:${minutes}:${seconds} UTC ${year}`;
+}
+
+function buildDefaultServerPropertiesContent(port: number) {
+  const managementServerSecret = randomBytes(24).toString("base64url");
+  const lines = [
+    "#Minecraft server properties",
+    `#${formatPropertiesTimestamp()}`,
+    "accepts-transfers=false",
+    "allow-flight=false",
+    "broadcast-console-to-ops=true",
+    "broadcast-rcon-to-ops=true",
+    "bug-report-link=",
+    "difficulty=easy",
+    "enable-code-of-conduct=false",
+    "enable-jmx-monitoring=false",
+    "enable-query=false",
+    "enable-rcon=true",
+    "enable-status=true",
+    "enforce-secure-profile=true",
+    "enforce-whitelist=false",
+    "entity-broadcast-range-percentage=100",
+    "force-gamemode=false",
+    "function-permission-level=2",
+    "gamemode=survival",
+    "generate-structures=true",
+    "generator-settings={}",
+    "hardcore=false",
+    "hide-online-players=false",
+    "initial-disabled-packs=",
+    "initial-enabled-packs=vanilla",
+    "level-name=world",
+    "level-seed=",
+    "level-type=minecraft\\:normal",
+    "log-ips=true",
+    "management-server-allowed-origins=",
+    "management-server-enabled=false",
+    "management-server-host=localhost",
+    "management-server-port=0",
+    `management-server-secret=${managementServerSecret}`,
+    "management-server-tls-enabled=true",
+    "management-server-tls-keystore=",
+    "management-server-tls-keystore-password=",
+    "max-chained-neighbor-updates=1000000",
+    "max-players=20",
+    "max-tick-time=60000",
+    "max-world-size=29999984",
+    "motd=A Minecraft Server",
+    "network-compression-threshold=256",
+    "online-mode=true",
+    "op-permission-level=4",
+    "pause-when-empty-seconds=60",
+    "player-idle-timeout=0",
+    "prevent-proxy-connections=false",
+    `query.port=${port}`,
+    "rate-limit=0",
+    "rcon.password=mycubekub",
+    "rcon.port=25575",
+    "region-file-compression=deflate",
+    "require-resource-pack=false",
+    "resource-pack=",
+    "resource-pack-id=",
+    "resource-pack-prompt=",
+    "resource-pack-sha1=",
+    "server-ip=",
+    `server-port=${port}`,
+    "simulation-distance=10",
+    "spawn-protection=16",
+    "status-heartbeat-interval=0",
+    "sync-chunk-writes=true",
+    "text-filtering-config=",
+    "text-filtering-version=0",
+    "use-native-transport=true",
+    "view-distance=10",
+    "white-list=false",
+  ];
+
+  return `${lines.join("\n")}\n`;
+}
+
+export async function createDefaultServerProperties(serverId: string, port: number) {
+  const propsPath = join(getServerDir(serverId), "data", "server.properties");
+  await mkdir(dirname(propsPath), { recursive: true });
+  await writeFile(propsPath, buildDefaultServerPropertiesContent(port), "utf-8");
+  return readServerProperties(serverId);
 }
 
 export { SERVERS_DIR };

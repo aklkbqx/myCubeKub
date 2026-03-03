@@ -21,6 +21,7 @@ import { healthService } from './services/HealthService';
 import { cacheService } from './services/CacheService';
 import cors from '@elysiajs/cors';
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { extname } from 'node:path';
 import { createSwaggerConfig } from './config/swagger';
 import { resolveLocaleFromAcceptLanguage } from './utils/locale';
 import { CACHE_TTL, cacheKeys } from './services/cacheKeys';
@@ -136,6 +137,14 @@ const isGuardedPath = (pathname: string) =>
   pathname === '/test' ||
   pathname.startsWith('/api');
 
+const PUBLIC_CONTENT_TYPE_BY_EXTENSION: Record<string, string> = {
+  ".zip": "application/zip",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+};
+
 const requiredEnvVars = { API_PORT, JWT_SECRET, PROJECT_NAME, PUBLIC_FILE_BASE_URL };
 Object.entries(requiredEnvVars).forEach(([key, value]) => {
   if (!value) {
@@ -179,7 +188,7 @@ const createBaseApp = () => {
           };
         }
 
-        set.headers['content-type'] = 'application/zip';
+        set.headers['content-type'] = PUBLIC_CONTENT_TYPE_BY_EXTENSION[extname(params.filename).toLowerCase()] || 'application/octet-stream';
         set.headers['cache-control'] = 'public, max-age=31536000, immutable';
         set.headers['content-disposition'] = `inline; filename="${params.filename}"`;
         return file;

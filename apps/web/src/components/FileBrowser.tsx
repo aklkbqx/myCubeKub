@@ -1,12 +1,13 @@
-import { useState, useEffect, useCallback, useRef, type ChangeEvent, type DragEvent } from "react";
+import { useState, useEffect, useCallback, useRef, type ReactNode, type ChangeEvent, type DragEvent } from "react";
 import { createPortal } from "react-dom";
 import { api, type FileInfo } from "@/lib/api";
 import { formatBytes } from "@/lib/utils";
 import {
     Folder, File, ArrowLeft, Trash2, Download, Upload,
-    FolderPlus, Edit3, X, Check, Inbox, Archive,
+    FolderPlus, Edit3, X, Check, Inbox, HardDriveDownload, Search, ArrowUpDown,
 } from "lucide-react";
 import { LoadingOverlay } from "./LoadingOverlay";
+import SelectDropdown from "./SelectDropdown";
 
 interface FileBrowserProps {
     serverId: string;
@@ -16,6 +17,52 @@ interface FileBrowserProps {
 type FileDeleteConfirmState =
     | { kind: "single"; item: FileInfo }
     | { kind: "bulk"; items: FileInfo[] };
+
+type UploadState = {
+    targetPath: string;
+    totalFiles: number;
+    completedFiles: number;
+    currentFileName: string;
+    percent: number;
+};
+
+interface IconTooltipProps {
+    label: string;
+    children: ReactNode;
+}
+
+function IconTooltip({ label, children }: IconTooltipProps) {
+    return (
+        <span className="group/icon-tooltip relative inline-flex">
+            {children}
+            <span className="pointer-events-none absolute -top-10 left-1/2 z-10 hidden -translate-x-1/2 whitespace-nowrap rounded-md border border-surface-700/80 bg-surface-950/95 px-2 py-1 text-[11px] font-medium text-surface-100 shadow-lg group-hover/icon-tooltip:block group-focus-within/icon-tooltip:block">
+                {label}
+            </span>
+        </span>
+    );
+}
+
+function joinRelativePath(basePath: string, name: string) {
+    return basePath ? `${basePath}/${name}` : name;
+}
+
+type FileFilterMode = "all" | "files" | "folders";
+type FileSortMode = "name-asc" | "name-desc" | "size-desc" | "size-asc" | "modified-desc" | "modified-asc";
+
+const FILE_FILTER_OPTIONS = [
+    { value: "all", label: "All items" },
+    { value: "files", label: "Files only" },
+    { value: "folders", label: "Folders only" },
+] as const;
+
+const FILE_SORT_OPTIONS = [
+    { value: "name-asc", label: "Name A-Z" },
+    { value: "name-desc", label: "Name Z-A" },
+    { value: "modified-desc", label: "Recently modified" },
+    { value: "modified-asc", label: "Oldest modified" },
+    { value: "size-desc", label: "Largest first" },
+    { value: "size-asc", label: "Smallest first" },
+] as const;
 
 export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
     const [currentPath, setCurrentPath] = useState("");
@@ -28,13 +75,20 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
     const [renameValue, setRenameValue] = useState("");
     const [error, setError] = useState("");
     const [uploading, setUploading] = useState(false);
+    const [uploadState, setUploadState] = useState<UploadState | null>(null);
     const [downloading, setDownloading] = useState(false);
     const [dragActive, setDragActive] = useState(false);
+    const [folderDropTarget, setFolderDropTarget] = useState<string | null>(null);
+    const [recentlyUploadedPaths, setRecentlyUploadedPaths] = useState<string[]>([]);
+    const [searchQuery, setSearchQuery] = useState("");
+    const [filterMode, setFilterMode] = useState<FileFilterMode>("all");
+    const [sortMode, setSortMode] = useState<FileSortMode>("name-asc");
     const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
     const [deleteConfirm, setDeleteConfirm] = useState<FileDeleteConfirmState | null>(null);
     const [previewImage, setPreviewImage] = useState<FileInfo | null>(null);
     const dragDepthRef = useRef(0);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const recentUploadTimeoutRef = useRef<number | null>(null);
 
     const normalizedCurrentPath =
         currentPath && currentPath !== "undefined" && currentPath !== "null"
@@ -81,6 +135,14 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
 
         return () => clearInterval(interval);
     }, [fetchFiles]);
+
+    useEffect(() => {
+        return () => {
+            if (recentUploadTimeoutRef.current) {
+                window.clearTimeout(recentUploadTimeoutRef.current);
+            }
+        };
+    }, []);
 
     const navigateToFolder = (path: string) => {
         setCurrentPath(path);
@@ -133,22 +195,63 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
         }
     };
 
-    const uploadFiles = useCallback(async (fileList: FileList | File[]) => {
+    const uploadFiles = useCallback(async (fileList: FileList | File[], targetPath?: string) => {
         const items = Array.from(fileList);
         if (items.length === 0) return;
+        const destinationPath = targetPath ?? normalizedCurrentPath;
 
         setUploading(true);
         setError("");
+        setFolderDropTarget(null);
+        setUploadState({
+            targetPath: destinationPath || "data",
+            totalFiles: items.length,
+            completedFiles: 0,
+            currentFileName: items[0]?.name || "",
+            percent: 0,
+        });
 
         try {
-            await Promise.all(
-                items.map((file) => api.files.upload(serverId, file, normalizedCurrentPath || undefined))
-            );
+            for (let index = 0; index < items.length; index += 1) {
+                const file = items[index];
+                await api.files.upload(serverId, file, destinationPath || undefined, (progress) => {
+                    const overallPercent = Math.round(((index + progress.percent / 100) / items.length) * 100);
+                    setUploadState({
+                        targetPath: destinationPath || "data",
+                        totalFiles: items.length,
+                        completedFiles: index,
+                        currentFileName: file.name,
+                        percent: overallPercent,
+                    });
+                });
+
+                setUploadState({
+                    targetPath: destinationPath || "data",
+                    totalFiles: items.length,
+                    completedFiles: index + 1,
+                    currentFileName: file.name,
+                    percent: Math.round(((index + 1) / items.length) * 100),
+                });
+            }
+
+            if (destinationPath === normalizedCurrentPath) {
+                const uploadedPaths = items.map((file) => joinRelativePath(destinationPath, file.name));
+                setRecentlyUploadedPaths(uploadedPaths);
+                if (recentUploadTimeoutRef.current) {
+                    window.clearTimeout(recentUploadTimeoutRef.current);
+                }
+                recentUploadTimeoutRef.current = window.setTimeout(() => {
+                    setRecentlyUploadedPaths([]);
+                    recentUploadTimeoutRef.current = null;
+                }, 8000);
+            }
+
             await fetchFiles();
         } catch (err: any) {
             setError(err.message || "Failed to upload file.");
         } finally {
             setUploading(false);
+            setUploadState(null);
         }
     }, [normalizedCurrentPath, fetchFiles, serverId]);
 
@@ -193,11 +296,25 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
         e.stopPropagation();
         dragDepthRef.current = 0;
         setDragActive(false);
+        setFolderDropTarget(null);
 
         const droppedFiles = e.dataTransfer.files;
         if (!droppedFiles?.length) return;
 
         await uploadFiles(droppedFiles);
+    };
+
+    const handleFolderDrop = async (e: DragEvent<HTMLDivElement>, folderPath: string) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragDepthRef.current = 0;
+        setDragActive(false);
+        setFolderDropTarget(null);
+
+        const droppedFiles = e.dataTransfer.files;
+        if (!droppedFiles?.length) return;
+
+        await uploadFiles(droppedFiles, folderPath);
     };
 
     const handleFileClick = (file: FileInfo) => {
@@ -218,7 +335,37 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
         );
     };
 
-    const selectableItems = files;
+    const normalizedSearchQuery = searchQuery.trim().toLowerCase();
+    const filteredFiles = files
+        .filter((file) => {
+            if (filterMode === "files" && file.isDirectory) return false;
+            if (filterMode === "folders" && !file.isDirectory) return false;
+            if (!normalizedSearchQuery) return true;
+
+            return file.name.toLowerCase().includes(normalizedSearchQuery);
+        })
+        .sort((left, right) => {
+            if (sortMode.startsWith("name")) {
+                const direction = sortMode === "name-desc" ? -1 : 1;
+                if (left.isDirectory !== right.isDirectory) {
+                    return left.isDirectory ? -1 : 1;
+                }
+                return left.name.localeCompare(right.name) * direction;
+            }
+
+            if (sortMode.startsWith("size")) {
+                const direction = sortMode === "size-desc" ? -1 : 1;
+                if (left.isDirectory !== right.isDirectory) {
+                    return left.isDirectory ? -1 : 1;
+                }
+                return (left.size - right.size) * direction;
+            }
+
+            const direction = sortMode === "modified-desc" ? -1 : 1;
+            return (new Date(left.modifiedAt).getTime() - new Date(right.modifiedAt).getTime()) * direction;
+        });
+
+    const selectableItems = filteredFiles;
     const hasSelectableItems = selectableItems.length > 0;
     const visibleSelectedItems = selectableItems.filter((file) => selectedPaths.includes(file.path));
     const allFilesSelected =
@@ -330,14 +477,12 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
         >
-            {(loading || uploading || downloading) && (
+            {(loading || downloading) && (
                 <LoadingOverlay
                     message={
-                        uploading
-                            ? "Uploading files"
-                            : downloading
-                                ? "Preparing downloads"
-                                : "Loading files"
+                        downloading
+                            ? "Preparing downloads"
+                            : "Loading files"
                     }
                     subtle
                 />
@@ -358,6 +503,29 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
             {error && (
                 <div className="mb-4 rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-300">
                     {error}
+                </div>
+            )}
+            {uploadState && (
+                <div className="mb-4 rounded-2xl border border-brand-500/20 bg-brand-500/10 px-4 py-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0">
+                            <p className="text-sm font-medium text-surface-100">
+                                Uploading to {uploadState.targetPath || "data"}
+                            </p>
+                            <p className="mt-1 truncate text-xs text-surface-400">
+                                {uploadState.currentFileName} • {uploadState.completedFiles}/{uploadState.totalFiles} completed
+                            </p>
+                        </div>
+                        <span className="text-sm font-semibold text-brand-200">
+                            {uploadState.percent}%
+                        </span>
+                    </div>
+                    <div className="mt-3 h-2 overflow-hidden rounded-full bg-surface-800">
+                        <div
+                            className="h-full rounded-full bg-brand-400 transition-[width]"
+                            style={{ width: `${uploadState.percent}%` }}
+                        />
+                    </div>
                 </div>
             )}
             {/* Toolbar */}
@@ -385,29 +553,94 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                 </div>
 
                 <div className="flex items-center justify-end gap-2">
-                    <button
-                        onClick={handleDownloadAll}
-                        disabled={downloading || uploading}
-                        className="btn-icon text-surface-400 hover:text-surface-200 disabled:cursor-not-allowed disabled:opacity-40"
-                        title="Download entire data folder"
-                    >
-                        <Archive size={16} />
-                    </button>
-                    <button
-                        onClick={handleDownloadSelected}
-                        disabled={selectedPaths.length === 0 || downloading}
-                        className="btn-icon text-surface-400 hover:text-surface-200 disabled:cursor-not-allowed disabled:opacity-40"
-                        title="Download selected"
-                    >
-                        <Download size={16} />
-                    </button>
-                    <button onClick={handleUpload} className="btn-icon text-surface-400 hover:text-surface-200" title="Upload">
-                        <Upload size={16} />
-                    </button>
-                    <button onClick={() => setShowNewFolder(true)} className="btn-icon text-surface-400 hover:text-surface-200" title="New folder">
-                        <FolderPlus size={16} />
-                    </button>
+                    <IconTooltip label="Download all">
+                        <button
+                            onClick={handleDownloadAll}
+                            disabled={downloading || uploading}
+                            className="btn-icon text-surface-400 hover:text-surface-200 disabled:cursor-not-allowed disabled:opacity-40"
+                            aria-label="Download entire data folder"
+                        >
+                            <HardDriveDownload size={16} />
+                        </button>
+                    </IconTooltip>
+                    <IconTooltip label="Upload files">
+                        <button
+                            onClick={handleUpload}
+                            className="btn-icon text-surface-400 hover:text-surface-200"
+                            aria-label="Upload files"
+                        >
+                            <Upload size={16} />
+                        </button>
+                    </IconTooltip>
+                    <IconTooltip label="Create folder">
+                        <button
+                            onClick={() => setShowNewFolder(true)}
+                            className="btn-icon text-surface-400 hover:text-surface-200"
+                            aria-label="Create folder"
+                        >
+                            <FolderPlus size={16} />
+                        </button>
+                    </IconTooltip>
                 </div>
+            </div>
+
+            <div className="mb-4 grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_180px_180px]">
+                <label className="relative block">
+                    <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-surface-500" />
+                    <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="Search files and folders"
+                        className="input-field w-full pl-9"
+                    />
+                </label>
+
+                <label className="relative block">
+                    <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-surface-500">
+                        <Folder size={14} />
+                    </span>
+                    <div className="pl-9">
+                        <SelectDropdown
+                            options={[...FILE_FILTER_OPTIONS]}
+                            value={filterMode}
+                            onChange={(value) => setFilterMode(value as FileFilterMode)}
+                            placeholder="Filter items"
+                        />
+                    </div>
+                </label>
+
+                <label className="relative block">
+                    <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-surface-500">
+                        <ArrowUpDown size={14} />
+                    </span>
+                    <div className="pl-9">
+                        <SelectDropdown
+                            options={[...FILE_SORT_OPTIONS]}
+                            value={sortMode}
+                            onChange={(value) => setSortMode(value as FileSortMode)}
+                            placeholder="Sort items"
+                        />
+                    </div>
+                </label>
+            </div>
+
+            <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-surface-400">
+                <span className="rounded-full border border-surface-700/70 bg-surface-900/70 px-3 py-1">
+                    Showing {filteredFiles.length} of {files.length} items
+                </span>
+                {(searchQuery || filterMode !== "all") && (
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setSearchQuery("");
+                            setFilterMode("all");
+                        }}
+                        className="rounded-full border border-brand-500/20 bg-brand-500/10 px-3 py-1 text-brand-300 transition-colors hover:bg-brand-500/15"
+                    >
+                        Clear filters
+                    </button>
+                )}
             </div>
 
             {/* New folder input */}
@@ -426,12 +659,16 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                             if (e.key === "Escape") setShowNewFolder(false);
                         }}
                     />
-                    <button onClick={handleCreateFolder} className="btn-icon text-brand-400">
-                        <Check size={14} />
-                    </button>
-                    <button onClick={() => setShowNewFolder(false)} className="btn-icon text-surface-500">
-                        <X size={14} />
-                    </button>
+                    <IconTooltip label="Create folder">
+                        <button onClick={handleCreateFolder} className="btn-icon text-brand-400" aria-label="Create folder">
+                            <Check size={14} />
+                        </button>
+                    </IconTooltip>
+                    <IconTooltip label="Cancel">
+                        <button onClick={() => setShowNewFolder(false)} className="btn-icon text-surface-500" aria-label="Cancel">
+                            <X size={14} />
+                        </button>
+                    </IconTooltip>
                 </div>
             )}
 
@@ -474,6 +711,15 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                         <div className="flex items-center gap-2">
                             <button
                                 type="button"
+                                onClick={handleDownloadSelected}
+                                disabled={downloading}
+                                className="inline-flex items-center gap-1 rounded-lg border border-brand-500/20 bg-brand-500/10 px-2.5 py-1.5 text-[11px] font-medium text-brand-200 transition-colors hover:border-brand-400/30 hover:bg-brand-500/15 hover:text-brand-100 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                <Download size={12} />
+                                Download {visibleSelectedItems.length} item{visibleSelectedItems.length > 1 ? "s" : ""}
+                            </button>
+                            <button
+                                type="button"
                                 onClick={handleDeleteSelected}
                                 className="inline-flex items-center gap-1 rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-1.5 text-[11px] font-medium text-red-300 transition-colors hover:border-red-400/30 hover:bg-red-500/15 hover:text-red-200"
                             >
@@ -506,26 +752,69 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
 
             <div className={`rounded-2xl border transition-colors duration-200 ${dragActive ? "border-brand-400/50 bg-brand-500/5" : "border-transparent"}`}>
                 {/* File list */}
-                {!loading && files.length === 0 ? (
+                {!loading && filteredFiles.length === 0 ? (
                     <button
                         type="button"
-                        onClick={handleUpload}
+                        onClick={() => {
+                            if (files.length === 0) {
+                                void handleUpload();
+                                return;
+                            }
+
+                            setSearchQuery("");
+                            setFilterMode("all");
+                        }}
                         className="flex w-full flex-col items-center justify-center rounded-2xl border border-dashed border-surface-700/80 bg-surface-900/40 px-6 py-10 text-center text-sm text-surface-500 transition-colors hover:border-brand-500/40 hover:bg-surface-900/70 hover:text-surface-300"
                     >
                         <Folder size={32} className="mx-auto mb-2 opacity-50" />
-                        <p>Empty directory</p>
-                        <p className="mt-2 text-xs text-surface-600">Click to upload or drag and drop files here</p>
+                        <p>{files.length === 0 ? "Empty directory" : "No matching files"}</p>
+                        <p className="mt-2 text-xs text-surface-600">
+                            {files.length === 0
+                                ? "Click to upload or drag and drop files here"
+                                : "Adjust search or filter to see more items"}
+                        </p>
                     </button>
                 ) : (
                     <div className="space-y-0.5 grid grid-cols-1">
-                        {files.map((file) => (
+                        {filteredFiles.map((file) => (
                             <div
                                 key={file.path}
-                                className={`grid cursor-pointer grid-cols-[minmax(0,1fr)_auto] gap-2 rounded-xl px-2 py-3 transition-colors group sm:grid-cols-[minmax(0,1fr)_80px_110px] sm:items-center ${selectedPaths.includes(file.path)
-                                    ? "border border-brand-500/25 bg-brand-500/10"
-                                    : "border border-transparent hover:bg-surface-800/50"
+                                className={`grid cursor-pointer grid-cols-[minmax(0,1fr)_auto] gap-2 rounded-xl px-2 py-3 transition-colors group sm:grid-cols-[minmax(0,1fr)_80px_110px] sm:items-center ${
+                                    folderDropTarget === file.path
+                                        ? "border border-brand-400/45 bg-brand-500/15"
+                                        // : recentlyUploadedPaths.includes(file.path)
+                                        //     ? "border border-emerald-500/25 bg-emerald-500/10"
+                                            : selectedPaths.includes(file.path)
+                                                ? "border border-brand-500/25 bg-brand-500/10"
+                                                : "border border-transparent hover:bg-surface-800/50"
                                     }`}
                                 onClick={() => handleFileClick(file)}
+                                onDragEnter={(e) => {
+                                    if (!file.isDirectory) return;
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    setFolderDropTarget(file.path);
+                                }}
+                                onDragOver={(e) => {
+                                    if (!file.isDirectory) return;
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    if (folderDropTarget !== file.path) {
+                                        setFolderDropTarget(file.path);
+                                    }
+                                }}
+                                onDragLeave={(e) => {
+                                    if (!file.isDirectory) return;
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    if (folderDropTarget === file.path) {
+                                        setFolderDropTarget(null);
+                                    }
+                                }}
+                                onDrop={(e) => {
+                                    if (!file.isDirectory) return;
+                                    void handleFolderDrop(e, file.path);
+                                }}
                             >
                                 <div className="items-center flex gap-2 flex-1 w-full">
                                     <button
@@ -560,9 +849,23 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                                             onBlur={() => handleRename(file)}
                                         />
                                     ) : (
-                                        <span className="flex-1 text-sm text-surface-200 truncate">
-                                            {file.name}
-                                        </span>
+                                        <div className="min-w-0 flex-1">
+                                            <div className="flex min-w-0 flex-wrap items-center gap-2">
+                                                <span className="truncate text-sm text-surface-200">
+                                                    {file.name}
+                                                </span>
+                                                {recentlyUploadedPaths.includes(file.path) && (
+                                                    <span className="inline-flex flex-shrink-0 rounded-full border border-emerald-500/35 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-emerald-200 shadow-[0_0_0_1px_rgba(16,185,129,0.08)]">
+                                                        New!
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {/* {file.isDirectory && folderDropTarget === file.path && (
+                                                <span className="mt-1 inline-flex rounded-full border border-brand-500/30 bg-brand-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-brand-200">
+                                                    Drop files here
+                                                </span>
+                                            )} */}
+                                        </div>
                                     )}
                                 </div>
 
@@ -577,42 +880,50 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                                 {/* Actions */}
                                 <div className="col-span-2 flex justify-end sm:col-span-1 sm:justify-center">
                                     <div className="flex items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100" onClick={(e) => e.stopPropagation()}>
-                                        <button
-                                            onClick={() => {
-                                                setRenamingFile(file.path);
-                                                setRenameValue(file.name);
-                                            }}
-                                            className="btn-icon text-surface-500 hover:text-surface-300 p-1"
-                                            title="Rename"
-                                        >
-                                            <Edit3 size={12} />
-                                        </button>
-                                        {!file.isDirectory && isTextFile(file.name) && (
+                                        <IconTooltip label="Rename">
                                             <button
-                                                onClick={() => onEditFile(file.path)}
+                                                onClick={() => {
+                                                    setRenamingFile(file.path);
+                                                    setRenameValue(file.name);
+                                                }}
                                                 className="btn-icon text-surface-500 hover:text-surface-300 p-1"
-                                                title="Edit"
+                                                aria-label={`Rename ${file.name}`}
                                             >
                                                 <Edit3 size={12} />
                                             </button>
+                                        </IconTooltip>
+                                        {!file.isDirectory && isTextFile(file.name) && (
+                                            <IconTooltip label="Edit">
+                                                <button
+                                                    onClick={() => onEditFile(file.path)}
+                                                    className="btn-icon text-surface-500 hover:text-surface-300 p-1"
+                                                    aria-label={`Edit ${file.name}`}
+                                                >
+                                                    <Edit3 size={12} />
+                                                </button>
+                                            </IconTooltip>
                                         )}
                                         {!file.isDirectory && (
-                                            <a
-                                                href={api.files.downloadUrl(serverId, file.path)}
-                                                className="btn-icon text-surface-500 hover:text-surface-300 p-1"
-                                                title="Download"
-                                                onClick={(e) => e.stopPropagation()}
-                                            >
-                                                <Download size={12} />
-                                            </a>
+                                            <IconTooltip label="Download">
+                                                <a
+                                                    href={api.files.downloadUrl(serverId, file.path)}
+                                                    className="btn-icon text-surface-500 hover:text-surface-300 p-1"
+                                                    aria-label={`Download ${file.name}`}
+                                                    onClick={(e) => e.stopPropagation()}
+                                                >
+                                                    <Download size={12} />
+                                                </a>
+                                            </IconTooltip>
                                         )}
-                                        <button
-                                            onClick={() => setDeleteConfirm({ kind: "single", item: file })}
-                                            className="btn-icon text-surface-500 hover:text-red-400 p-1"
-                                            title="Delete"
-                                        >
-                                            <Trash2 size={12} />
-                                        </button>
+                                        <IconTooltip label="Delete">
+                                            <button
+                                                onClick={() => setDeleteConfirm({ kind: "single", item: file })}
+                                                className="btn-icon text-surface-500 hover:text-red-400 p-1"
+                                                aria-label={`Delete ${file.name}`}
+                                            >
+                                                <Trash2 size={12} />
+                                            </button>
+                                        </IconTooltip>
                                     </div>
                                 </div>
                             </div>
@@ -688,14 +999,16 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                                     {formatBytes(previewImage.size)}
                                 </p>
                             </div>
-                            <button
-                                type="button"
-                                onClick={() => setPreviewImage(null)}
-                                className="btn-icon text-surface-400 hover:text-surface-100"
-                                aria-label="Close image preview"
-                            >
-                                <X size={16} />
-                            </button>
+                            <IconTooltip label="Close preview">
+                                <button
+                                    type="button"
+                                    onClick={() => setPreviewImage(null)}
+                                    className="btn-icon text-surface-400 hover:text-surface-100"
+                                    aria-label="Close image preview"
+                                >
+                                    <X size={16} />
+                                </button>
+                            </IconTooltip>
                         </div>
 
                         <div className="flex max-h-[75vh] items-center justify-center overflow-auto rounded-2xl border border-surface-800 bg-surface-950/70 p-3">

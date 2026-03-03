@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, ApiError } from "@/lib/api";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
@@ -9,6 +9,30 @@ export function Login() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [checkingSession, setCheckingSession] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkSession = async () => {
+      try {
+        await api.auth.me();
+        if (!cancelled) {
+          navigate("/", { replace: true });
+        }
+      } catch {
+        if (!cancelled) {
+          setCheckingSession(false);
+        }
+      }
+    };
+
+    void checkSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [navigate]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -40,7 +64,9 @@ export function Login() {
       <div className="page-shell flex min-h-[calc(100vh-3rem)] items-center sm:min-h-[calc(100vh-5rem)]">
         <div className="grid w-full gap-5 lg:grid-cols-[1.2fr_0.8fr] lg:gap-6">
           <div className="order-1 minecraft-card animate-slide-up p-5 sm:p-8 lg:order-2">
-            {loading && <LoadingOverlay message="Signing in" subtle />}
+            {(loading || checkingSession) && (
+              <LoadingOverlay message={checkingSession ? "Checking session" : "Signing in"} subtle />
+            )}
             <div className="relative">
               <div className="mb-6">
                 <p className="text-[11px] uppercase tracking-[0.24em] text-brand-300/80">Operator Access</p>
@@ -70,7 +96,8 @@ export function Login() {
                     placeholder="Enter your username"
                     className="input-field w-full"
                     required
-                    autoFocus
+                    autoFocus={!checkingSession}
+                    disabled={checkingSession || loading}
                   />
                 </div>
 
@@ -89,12 +116,13 @@ export function Login() {
                     placeholder="Enter your password"
                     className="input-field w-full"
                     required
+                    disabled={checkingSession || loading}
                   />
                 </div>
 
                 <button
                   type="submit"
-                  disabled={loading || !username || !password}
+                  disabled={checkingSession || loading || !username || !password}
                   className="btn-primary w-full py-3 text-base disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {loading ? (

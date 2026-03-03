@@ -26,6 +26,10 @@ export const servers = pgTable("servers", {
   type: text("type").notNull().default("vanilla"), // vanilla, paper, fabric, forge
   memoryMb: integer("memory_mb").notNull().default(1024),
   statusCache: text("status_cache").default("unknown"), // running, stopped, error, unknown
+  autoBackupEnabled: boolean("auto_backup_enabled").notNull().default(false),
+  autoBackupIntervalHours: integer("auto_backup_interval_hours").notNull().default(24),
+  autoBackupRetentionCount: integer("auto_backup_retention_count").notNull().default(5),
+  lastAutoBackupAt: timestamp("last_auto_backup_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
@@ -49,6 +53,8 @@ export const resourcePacks = pgTable("resource_packs", {
   originalFilename: text("original_filename").notNull(),
   storedFilename: text("stored_filename").notNull(),
   filePath: text("file_path").notNull(),
+  imageFilename: text("image_filename"),
+  imagePublicPath: text("image_public_path"),
   sha1: text("sha1").notNull(),
   sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -61,6 +67,8 @@ export const resourcePackBuilds = pgTable("resource_pack_builds", {
   generatedFilename: text("generated_filename").notNull(),
   filePath: text("file_path").notNull(),
   publicPath: text("public_path").notNull(),
+  imageFilename: text("image_filename"),
+  imagePublicPath: text("image_public_path"),
   sha1: text("sha1").notNull(),
   sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
   conflictCount: integer("conflict_count").notNull().default(0),

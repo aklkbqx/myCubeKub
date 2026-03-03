@@ -3,6 +3,7 @@ import type { App } from "@mycubekub/api-contract";
 import type {
   ConsoleEvent,
   ConsoleCommandMessage,
+  BackupInfo,
   CreateServerData,
   FileInfo,
   ResourcePackBuildDetail,
@@ -177,11 +178,40 @@ class ApiClient {
     stats: (id: string): Promise<{ stats: ServerStats | null; status: string }> =>
       this.unwrap<{ stats: ServerStats | null; status: string }>(treaty.servers[id].stats.get({})),
 
-    getProperties: (id: string): Promise<{ properties: Record<string, string> }> =>
-      this.unwrap<{ properties: Record<string, string> }>(treaty.servers[id].properties.get({})),
+    getProperties: (id: string): Promise<{ properties: Record<string, string>; exists: boolean }> =>
+      this.unwrap<{ properties: Record<string, string>; exists: boolean }>(treaty.servers[id].properties.get({})),
 
     updateProperties: (id: string, properties: Record<string, string>): Promise<{ success: boolean }> =>
       this.unwrap<{ success: boolean }>(treaty.servers[id].properties.put({ properties })),
+
+    createProperties: (id: string): Promise<{ success: boolean; properties: Record<string, string>; exists: boolean }> =>
+      this.requestJson<{ success: boolean; properties: Record<string, string>; exists: boolean }>(
+        `${API_BASE}/servers/${encodeURIComponent(id)}/properties/create`,
+        { method: "POST" }
+      ),
+
+    listBackups: (id: string): Promise<{ backups: BackupInfo[] }> =>
+      this.requestJson<{ backups: BackupInfo[] }>(`${API_BASE}/servers/${encodeURIComponent(id)}/backups`),
+
+    createBackup: (id: string): Promise<{ backup: BackupInfo }> =>
+      this.requestJson<{ backup: BackupInfo }>(`${API_BASE}/servers/${encodeURIComponent(id)}/backups`, {
+        method: "POST",
+      }),
+
+    restoreBackup: (id: string, backupId: string): Promise<{ success: boolean; backup: BackupInfo; status: string }> =>
+      this.requestJson<{ success: boolean; backup: BackupInfo; status: string }>(
+        `${API_BASE}/servers/${encodeURIComponent(id)}/backups/${encodeURIComponent(backupId)}/restore`,
+        { method: "POST" }
+      ),
+
+    deleteBackup: (id: string, backupId: string): Promise<{ success: boolean }> =>
+      this.requestJson<{ success: boolean }>(
+        `${API_BASE}/servers/${encodeURIComponent(id)}/backups/${encodeURIComponent(backupId)}`,
+        { method: "DELETE" }
+      ),
+
+    downloadBackupUrl: (id: string, backupId: string) =>
+      `${API_BASE}/servers/${encodeURIComponent(id)}/backups/${encodeURIComponent(backupId)}/download`,
   };
 
   // ─── Health ──────────────────────────────────────────────
@@ -221,13 +251,33 @@ class ApiClient {
         treaty.servers[serverId].files.rename.patch({ oldPath, newPath })
       ),
 
-    upload: (serverId: string, file: File, path?: string): Promise<{ success: boolean; filename: string }> =>
-      this.unwrap<{ success: boolean; filename: string }>(
+    upload: (
+      serverId: string,
+      file: File,
+      path?: string,
+      onProgress?: (progress: { loaded: number; total: number; percent: number }) => void
+    ): Promise<{ success: boolean; filename: string }> => {
+      if (onProgress) {
+        const formData = new FormData();
+        formData.append("file", file);
+        if (path) {
+          formData.append("path", path);
+        }
+
+        return this.uploadFormDataWithProgress<{ success: boolean; filename: string }>(
+          `${API_BASE}/servers/${encodeURIComponent(serverId)}/files/upload`,
+          formData,
+          onProgress
+        );
+      }
+
+      return this.unwrap<{ success: boolean; filename: string }>(
         treaty.servers[serverId].files.upload.post({
           file,
           ...this.optionalPathQuery(path),
         })
-      ),
+      );
+    },
 
     downloadAllUrl: (serverId: string) =>
       `/api/servers/${serverId}/files/download-all`,
@@ -270,6 +320,16 @@ class ApiClient {
       );
     },
 
+    updateBuildImage: (buildId: string, file: File): Promise<{ build: ResourcePackBuildInfo }> => {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      return this.uploadFormDataWithProgress<{ build: ResourcePackBuildInfo }>(
+        `${API_BASE}/resource-packs/builds/${buildId}/image`,
+        formData
+      );
+    },
+
     delete: (packId: string): Promise<{ success: boolean }> =>
       this.requestJson<{ success: boolean }>(`${API_BASE}/resource-packs/${packId}`, {
         method: "DELETE",
@@ -282,12 +342,25 @@ class ApiClient {
         body: JSON.stringify({ name }),
       }),
 
-    build: (serverId: string, name: string, packIds: string[]): Promise<{ build: ResourcePackBuildInfo; conflicts: string[] }> =>
-      this.requestJson<{ build: ResourcePackBuildInfo; conflicts: string[] }>(`${API_BASE}/resource-packs/build`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ serverId, name, packIds }),
-      }),
+    build: (
+      serverId: string,
+      name: string,
+      packIds: string[],
+      image?: File
+    ): Promise<{ build: ResourcePackBuildInfo; conflicts: string[] }> => {
+      const formData = new FormData();
+      formData.append("serverId", serverId);
+      formData.append("name", name);
+      packIds.forEach((packId) => formData.append("packIds", packId));
+      if (image) {
+        formData.append("image", image);
+      }
+
+      return this.uploadFormDataWithProgress<{ build: ResourcePackBuildInfo; conflicts: string[] }>(
+        `${API_BASE}/resource-packs/build`,
+        formData
+      );
+    },
 
     preview: (serverId: string, packIds: string[]): Promise<{ packs: ResourcePackInfo[]; conflicts: string[] }> =>
       this.requestJson<{ packs: ResourcePackInfo[]; conflicts: string[] }>(`${API_BASE}/resource-packs/preview`, {
@@ -346,6 +419,7 @@ export class ApiError extends Error {
 
 export const api = new ApiClient();
 export type {
+  BackupInfo,
   ConsoleEvent,
   ConsoleCommandMessage,
   CreateServerData,

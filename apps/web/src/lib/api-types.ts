@@ -7,6 +7,10 @@ export interface ServerInfo {
   type: string;
   memoryMb: number;
   statusCache: string | null;
+  autoBackupEnabled: boolean;
+  autoBackupIntervalHours: number;
+  autoBackupRetentionCount: number;
+  lastAutoBackupAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -37,7 +41,19 @@ export interface UpdateServerData {
   version?: string;
   type?: string;
   memoryMb?: number;
-  jvmArgs?: string;
+  autoBackupEnabled?: boolean;
+  autoBackupIntervalHours?: number;
+  autoBackupRetentionCount?: number;
+}
+
+export interface BackupInfo {
+  id: string;
+  serverId: string;
+  filename: string;
+  filePath: string;
+  sizeBytes: number | null;
+  createdAt: string;
+  isAuto: boolean | null;
 }
 
 export interface FileInfo {
@@ -53,6 +69,9 @@ export interface ResourcePackInfo {
   name: string;
   originalFilename: string;
   storedFilename: string;
+  imageFilename: string | null;
+  imagePublicPath: string | null;
+  imageUrl: string | null;
   sha1: string;
   sizeBytes: number;
   createdAt: string;
@@ -64,6 +83,9 @@ export interface ResourcePackBuildInfo {
   generatedFilename: string;
   publicPath: string;
   publicUrl: string;
+  imageFilename: string | null;
+  imagePublicPath: string | null;
+  imageUrl: string | null;
   sha1: string;
   sizeBytes: number;
   conflictCount: number;

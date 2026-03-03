@@ -3,6 +3,8 @@ import { db, schema } from "../db";
 import { and, eq, ne } from "drizzle-orm";
 import * as dockerService from "../services/docker";
 import * as composeService from "../services/compose";
+import * as backupService from "../services/backups";
+import * as resourcePackService from "../services/resourcePacks";
 import authGuard from "../services/authGuard";
 import { cacheService } from "../services/CacheService";
 import { CACHE_TTL, cacheKeys } from "../services/cacheKeys";
@@ -34,8 +36,22 @@ const serverInfoSchema = t.Object({
   type: t.String(),
   memoryMb: t.Number(),
   statusCache: t.Nullable(t.String()),
+  autoBackupEnabled: t.Boolean(),
+  autoBackupIntervalHours: t.Number(),
+  autoBackupRetentionCount: t.Number(),
+  lastAutoBackupAt: t.Nullable(t.String()),
   createdAt: t.String(),
   updatedAt: t.String(),
+});
+
+const backupInfoSchema = t.Object({
+  id: t.String(),
+  serverId: t.String(),
+  filename: t.String(),
+  filePath: t.String(),
+  sizeBytes: t.Nullable(t.Number()),
+  createdAt: t.String(),
+  isAuto: t.Nullable(t.Boolean()),
 });
 
 const serverWithStatusSchema = t.Object({
@@ -62,17 +78,38 @@ interface SerializedServerWithStatus {
   type: string;
   memoryMb: number;
   statusCache: string | null;
+  autoBackupEnabled: boolean;
+  autoBackupIntervalHours: number;
+  autoBackupRetentionCount: number;
+  lastAutoBackupAt: string | null;
   createdAt: string;
   updatedAt: string;
   status: ServerStatus;
   stats: ServerStats | null;
 }
 
-function serializeServer<T extends { createdAt: Date; updatedAt: Date }>(server: T) {
+type SerializedServerRecord<T extends {
+  createdAt: Date;
+  updatedAt: Date;
+  lastAutoBackupAt?: Date | null;
+}> = Omit<T, "createdAt" | "updatedAt" | "lastAutoBackupAt"> & {
+  createdAt: string;
+  updatedAt: string;
+  lastAutoBackupAt: string | null;
+};
+
+function serializeServer<T extends {
+  createdAt: Date;
+  updatedAt: Date;
+  lastAutoBackupAt?: Date | null;
+}>(server: T): SerializedServerRecord<T> {
+  const { createdAt, updatedAt, lastAutoBackupAt, ...rest } = server;
+
   return {
-    ...server,
-    createdAt: server.createdAt.toISOString(),
-    updatedAt: server.updatedAt.toISOString(),
+    ...rest,
+    createdAt: createdAt.toISOString(),
+    updatedAt: updatedAt.toISOString(),
+    lastAutoBackupAt: lastAutoBackupAt?.toISOString() ?? null,
   };
 }
 
@@ -402,17 +439,25 @@ const serverRoutes = new Elysia({ prefix: "/servers" })
           }
         }
 
-        const nextConfig = {
-          serverId: id,
-          name: body.name ?? server.name,
-          port: body.port ?? server.port,
-          version: body.version ?? server.version,
-          type: body.type ?? server.type,
-          memoryMb: body.memoryMb ?? server.memoryMb,
-          jvmArgs: body.jvmArgs,
-        };
+        const requiresRuntimeUpdate =
+          body.name !== undefined ||
+          body.port !== undefined ||
+          body.version !== undefined ||
+          body.type !== undefined ||
+          body.memoryMb !== undefined;
 
-        await composeService.updateServerFiles(nextConfig);
+        if (requiresRuntimeUpdate) {
+          const nextConfig = {
+            serverId: id,
+            name: body.name ?? server.name,
+            port: body.port ?? server.port,
+            version: body.version ?? server.version,
+            type: body.type ?? server.type,
+            memoryMb: body.memoryMb ?? server.memoryMb,
+          };
+
+          await composeService.updateServerFiles(nextConfig);
+        }
 
         const updates: Record<string, any> = { updatedAt: new Date() };
         if (body.name !== undefined) updates.name = body.name;
@@ -420,6 +465,9 @@ const serverRoutes = new Elysia({ prefix: "/servers" })
         if (body.version !== undefined) updates.version = body.version;
         if (body.type !== undefined) updates.type = body.type;
         if (body.memoryMb !== undefined) updates.memoryMb = body.memoryMb;
+        if (body.autoBackupEnabled !== undefined) updates.autoBackupEnabled = body.autoBackupEnabled;
+        if (body.autoBackupIntervalHours !== undefined) updates.autoBackupIntervalHours = body.autoBackupIntervalHours;
+        if (body.autoBackupRetentionCount !== undefined) updates.autoBackupRetentionCount = 5;
 
         // Update DB
         const [updated] = await db
@@ -454,7 +502,9 @@ const serverRoutes = new Elysia({ prefix: "/servers" })
         version: t.Optional(t.String()),
         type: t.Optional(t.String()),
         memoryMb: t.Optional(t.Number({ minimum: 512 })),
-        jvmArgs: t.Optional(t.String()),
+        autoBackupEnabled: t.Optional(t.Boolean()),
+        autoBackupIntervalHours: t.Optional(t.Number({ minimum: 1, maximum: 168 })),
+        autoBackupRetentionCount: t.Optional(t.Number({ minimum: 1, maximum: 50 })),
       }),
       response: {
         200: t.Object({
@@ -494,10 +544,16 @@ const serverRoutes = new Elysia({ prefix: "/servers" })
           await dockerService.composeDown(serverDir);
         } catch { /* ok */ }
 
+        // Delete related resource pack files and rows
+        await resourcePackService.deleteResourcePackDataForServer(id);
+
+        // Delete related backups and rows
+        await backupService.deleteBackupsForServer(id);
+
         // Delete server files
         await composeService.deleteServerFiles(id);
 
-        // Delete from DB (cascades to backups)
+        // Delete server record after related data has been cleaned up
         await db.delete(schema.servers).where(eq(schema.servers.id, id));
 
         await invalidateServerCache(id);
@@ -748,9 +804,7 @@ const serverRoutes = new Elysia({ prefix: "/servers" })
       const payload = await cacheService.remember(
         cacheKeys.servers.properties(id),
         CACHE_TTL.serverProperties,
-        async () => ({
-          properties: await composeService.readServerProperties(id),
-        })
+        async () => composeService.readServerProperties(id)
       );
 
       return payload;
@@ -760,6 +814,7 @@ const serverRoutes = new Elysia({ prefix: "/servers" })
       response: {
         200: t.Object({
           properties: t.Record(t.String(), t.String()),
+          exists: t.Boolean(),
         }),
         401: errorResponse,
         404: errorResponse,
@@ -801,6 +856,239 @@ const serverRoutes = new Elysia({ prefix: "/servers" })
         401: errorResponse,
         404: errorResponse,
         500: errorResponse,
+      },
+    }
+  )
+
+  // ─── Create default server.properties ─────────────────────
+  .post(
+    "/:id/properties/create",
+    async ({ params: { id }, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      try {
+        const created = await composeService.createDefaultServerProperties(id, server.port);
+        await invalidateServerCache(id);
+        return {
+          success: true,
+          properties: created.properties,
+          exists: created.exists,
+        };
+      } catch (err: any) {
+        set.status = 500;
+        return { error: `Failed to create server.properties: ${err.message}` };
+      }
+    },
+    {
+      params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({
+          success: t.Boolean(),
+          properties: t.Record(t.String(), t.String()),
+          exists: t.Boolean(),
+        }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+
+  // ─── List backups ────────────────────────────────────────
+  .get(
+    "/:id/backups",
+    async ({ params: { id }, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      return { backups: await backupService.listBackups(id) };
+    },
+    {
+      params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({ backups: t.Array(backupInfoSchema) }),
+        401: errorResponse,
+        404: errorResponse,
+      },
+    }
+  )
+
+  // ─── Create backup ───────────────────────────────────────
+  .post(
+    "/:id/backups",
+    async ({ params: { id }, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      try {
+        const backup = await backupService.createBackup(id, false);
+        return { backup };
+      } catch (err: any) {
+        set.status = 500;
+        return { error: `Failed to create backup: ${err.message}` };
+      }
+    },
+    {
+      params: t.Object({ id: t.String() }),
+      response: {
+        200: t.Object({ backup: backupInfoSchema }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+
+  // ─── Restore backup ──────────────────────────────────────
+  .post(
+    "/:id/backups/:backupId/restore",
+    async ({ params: { id, backupId }, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      try {
+        const restored = await backupService.restoreBackup(id, backupId);
+        await invalidateServerCache(id);
+        return {
+          success: true,
+          backup: restored.backup,
+          status: restored.serverStatus,
+        };
+      } catch (err: any) {
+        if (err.message === "Backup not found") {
+          set.status = 404;
+          return { error: err.message };
+        }
+        set.status = 500;
+        return { error: `Failed to restore backup: ${err.message}` };
+      }
+    },
+    {
+      params: t.Object({
+        id: t.String(),
+        backupId: t.String(),
+      }),
+      response: {
+        200: t.Object({
+          success: t.Boolean(),
+          backup: backupInfoSchema,
+          status: t.String(),
+        }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+
+  // ─── Delete backup ───────────────────────────────────────
+  .delete(
+    "/:id/backups/:backupId",
+    async ({ params: { id, backupId }, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      try {
+        const backup = await backupService.getBackupById(backupId);
+        if (!backup || backup.serverId !== id) {
+          set.status = 404;
+          return { error: "Backup not found" };
+        }
+
+        await backupService.deleteBackup(backupId);
+        return { success: true };
+      } catch (err: any) {
+        if (err.message === "Backup not found") {
+          set.status = 404;
+          return { error: err.message };
+        }
+        set.status = 500;
+        return { error: `Failed to delete backup: ${err.message}` };
+      }
+    },
+    {
+      params: t.Object({
+        id: t.String(),
+        backupId: t.String(),
+      }),
+      response: {
+        200: t.Object({ success: t.Boolean() }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+
+  // ─── Download backup ─────────────────────────────────────
+  .get(
+    "/:id/backups/:backupId/download",
+    async ({ params: { id, backupId }, set }) => {
+      const backup = await backupService.getBackupById(backupId);
+      if (!backup || backup.serverId !== id) {
+        set.status = 404;
+        return { error: "Backup not found" };
+      }
+
+      try {
+        await backupService.assertBackupReadable(backup.filePath);
+      } catch {
+        set.status = 404;
+        return { error: "Backup file not found" };
+      }
+
+      set.headers["content-disposition"] = `attachment; filename="${backup.filename}"`;
+      return Bun.file(backup.filePath);
+    },
+    {
+      params: t.Object({
+        id: t.String(),
+        backupId: t.String(),
+      }),
+      response: {
+        401: errorResponse,
+        404: errorResponse,
       },
     }
   );

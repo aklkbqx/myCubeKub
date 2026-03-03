@@ -5,6 +5,9 @@ import Files from "./files"
 import Console from "./console"
 import Servers from "./servers"
 import ResourcePacks from "./resourcePacks"
+import { startAutoBackupScheduler } from "../services/backups"
+
+startAutoBackupScheduler();
 
 const app = new Elysia()
     .get(
