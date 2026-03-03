@@ -66,6 +66,9 @@ const resourcePackBuildDetailSchema = t.Object({
 
 function serializePack(pack: typeof schema.resourcePacks.$inferSelect) {
   const imageIsAvailable = hasPublicResourcePackFile(pack.imageFilename || pack.imagePublicPath);
+  const imageUrl = imageIsAvailable && pack.imagePublicPath
+    ? `${getBrowserResourcePackUrl(pack.imagePublicPath)}?v=${encodeURIComponent(pack.sha1)}`
+    : null;
 
   return {
     id: pack.id,
@@ -74,7 +77,7 @@ function serializePack(pack: typeof schema.resourcePacks.$inferSelect) {
     storedFilename: pack.storedFilename,
     imageFilename: imageIsAvailable ? pack.imageFilename : null,
     imagePublicPath: imageIsAvailable ? pack.imagePublicPath : null,
-    imageUrl: imageIsAvailable && pack.imagePublicPath ? getBrowserResourcePackUrl(pack.imagePublicPath) : null,
+    imageUrl,
     sha1: pack.sha1,
     sizeBytes: pack.sizeBytes,
     createdAt: pack.createdAt.toISOString(),
@@ -87,6 +90,9 @@ function serializeBuild(
   options: { assignedToServer?: boolean } = {}
 ) {
   const imageIsAvailable = hasPublicResourcePackFile(build.imageFilename || build.imagePublicPath);
+  const imageUrl = imageIsAvailable && build.imagePublicPath
+    ? `${getBrowserResourcePackUrl(build.imagePublicPath)}?v=${encodeURIComponent(build.sha1)}`
+    : null;
 
   return {
     id: build.id,
@@ -98,7 +104,7 @@ function serializeBuild(
     assignedToServer: options.assignedToServer ?? false,
     imageFilename: imageIsAvailable ? build.imageFilename : null,
     imagePublicPath: imageIsAvailable ? build.imagePublicPath : null,
-    imageUrl: imageIsAvailable && build.imagePublicPath ? getBrowserResourcePackUrl(build.imagePublicPath) : null,
+    imageUrl,
     sha1: build.sha1,
     sizeBytes: build.sizeBytes,
     conflictCount: build.conflictCount,
@@ -124,11 +130,52 @@ async function invalidateServerPropertiesCache(serverId: string) {
   ]);
 }
 
+async function syncAssignedBuildPropertiesIfNeeded(
+  buildBeforeChange: typeof schema.resourcePackBuilds.$inferSelect,
+  buildAfterChange: typeof schema.resourcePackBuilds.$inferSelect
+) {
+  if (!buildBeforeChange.serverId) {
+    return false;
+  }
+
+  const { properties: currentProperties } = await composeService.readServerProperties(buildBeforeChange.serverId);
+  const wasAssigned = isBuildAssignedToServer(buildBeforeChange, currentProperties);
+
+  if (!wasAssigned) {
+    return false;
+  }
+
+  await composeService.writeServerProperties(buildBeforeChange.serverId, {
+    ...currentProperties,
+    "resource-pack": getPublicResourcePackUrl(buildAfterChange.publicPath),
+    "resource-pack-sha1": buildAfterChange.sha1,
+  });
+  await invalidateServerPropertiesCache(buildBeforeChange.serverId);
+
+  return true;
+}
+
 function isBuildAssignedToServer(
   build: typeof schema.resourcePackBuilds.$inferSelect,
   properties: Record<string, string>
 ) {
-  return properties["resource-pack"] === getPublicResourcePackUrl(build.publicPath);
+  const assignedUrl = properties["resource-pack"]?.trim();
+  const assignedSha1 = properties["resource-pack-sha1"]?.trim();
+  const buildUrl = getPublicResourcePackUrl(build.publicPath);
+
+  if (!assignedUrl) {
+    return false;
+  }
+
+  if (assignedUrl !== buildUrl) {
+    return false;
+  }
+
+  if (!assignedSha1) {
+    return true;
+  }
+
+  return assignedSha1 === build.sha1;
 }
 
 const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
@@ -334,8 +381,13 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
         .select()
         .from(schema.resourcePackBuildItems)
         .where(eq(schema.resourcePackBuildItems.buildId, id));
+      const assignedToServer = await syncAssignedBuildPropertiesIfNeeded(existingBuild, build);
 
-      return { build: serializeBuild(build, items.length) };
+      return {
+        build: serializeBuild(build, items.length, {
+          assignedToServer,
+        }),
+      };
     },
     {
       params: t.Object({ id: t.String() }),
@@ -435,9 +487,12 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
         .map((item) => packById.get(item.packId))
         .filter((pack): pack is typeof packs[number] => Boolean(pack));
       const manifest = await readResourcePackManifest(build.generatedFilename);
+      const { properties: currentProperties } = await composeService.readServerProperties(query.serverId);
 
       return {
-        build: serializeBuild(build, orderedPacks.length),
+        build: serializeBuild(build, orderedPacks.length, {
+          assignedToServer: isBuildAssignedToServer(build, currentProperties),
+        }),
         packs: orderedPacks.map(serializePack),
         conflicts: manifest?.conflictPaths || [],
       };
@@ -589,7 +644,13 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
           .where(eq(schema.resourcePackBuilds.id, id))
           .returning();
 
-        return { build: serializeBuild(updatedBuild, items.length) };
+        const assignedToServer = await syncAssignedBuildPropertiesIfNeeded(build, updatedBuild);
+
+        return {
+          build: serializeBuild(updatedBuild, items.length, {
+            assignedToServer,
+          }),
+        };
       } catch (err: any) {
         set.status = 500;
         return { error: err.message || "Failed to update merged resource pack image" };
@@ -736,11 +797,14 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
           .where(eq(schema.resourcePackBuildItems.buildId, build.id));
 
         const { properties: currentProperties } = await composeService.readServerProperties(server.id);
+        const nextRequireResourcePack = body.required !== undefined
+          ? (body.required ? "true" : "false")
+          : (currentProperties["require-resource-pack"] || "false");
         const nextProperties: Record<string, string> = {
           ...currentProperties,
           "resource-pack": getPublicResourcePackUrl(build.publicPath),
           "resource-pack-sha1": build.sha1,
-          "require-resource-pack": body.required ? "true" : "false",
+          "require-resource-pack": nextRequireResourcePack,
         };
 
         if (body.prompt !== undefined) {

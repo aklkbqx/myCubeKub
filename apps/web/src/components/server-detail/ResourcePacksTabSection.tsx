@@ -13,7 +13,7 @@ import {
   WandSparkles,
   X,
 } from "lucide-react";
-import type { ResourcePackBuildInfo } from "@/lib/api";
+import type { ResourcePackBuildDetail, ResourcePackBuildInfo } from "@/lib/api";
 import type { AvailableResourcePack } from "@/components/server-detail/server-detail-types";
 import { cn, formatBytes } from "@/lib/utils";
 
@@ -94,7 +94,10 @@ interface ResourcePacksTabSectionProps {
   handleBuildImageSelected: (event: ChangeEvent<HTMLInputElement>) => void | Promise<void>;
   resourcePackNotice: string;
   resourcePackProgress: { label: string; percent: number } | null;
+  selectedBuildId: string | null;
+  selectedBuildDetail: ResourcePackBuildDetail | null;
   orderedAvailablePacks: AvailableResourcePack[];
+  orderedLibraryPacks: AvailableResourcePack[];
   selectedPackIds: string[];
   toggleSelectAllPacks: () => void;
   allAvailablePacksSelected: boolean;
@@ -126,6 +129,8 @@ interface ResourcePacksTabSectionProps {
   handleBuildMergedPack: () => void | Promise<void>;
   previewPackNames: string[];
   previewConflicts: string[];
+  selectBuild: (buildId: string) => void | Promise<void>;
+  clearSelectedBuild: () => void;
   resourcePackBuilds: ResourcePackBuildInfo[];
   editingBuildId: string | null;
   editingBuildName: string;
@@ -155,7 +160,10 @@ export function ResourcePacksTabSection({
   handleBuildImageSelected,
   resourcePackNotice,
   resourcePackProgress,
+  selectedBuildId,
+  selectedBuildDetail,
   orderedAvailablePacks,
+  orderedLibraryPacks,
   selectedPackIds,
   toggleSelectAllPacks,
   allAvailablePacksSelected,
@@ -187,6 +195,8 @@ export function ResourcePacksTabSection({
   handleBuildMergedPack,
   previewPackNames,
   previewConflicts,
+  selectBuild,
+  clearSelectedBuild,
   resourcePackBuilds,
   editingBuildId,
   editingBuildName,
@@ -200,9 +210,15 @@ export function ResourcePacksTabSection({
   handleAssignBuild,
   setDeleteBuildConfirm,
 }: ResourcePacksTabSectionProps) {
+  const builderPanelRef = useRef<HTMLDivElement | null>(null);
   const packCardRefs = useRef(new Map<string, HTMLDivElement>());
   const previousPackPositionsRef = useRef(new Map<string, DOMRect>());
   const previousPackOrderRef = useRef<string[]>([]);
+  const isBuildSelected = Boolean(selectedBuildDetail);
+  const selectedBuild = selectedBuildDetail?.build ?? null;
+  const selectedBuildPacks = Array.isArray(selectedBuildDetail?.packs) ? selectedBuildDetail.packs : [];
+  const activeConflictPreview = Array.isArray(selectedBuildDetail?.conflicts) ? selectedBuildDetail.conflicts : previewConflicts;
+  const activePackPreviewNames = selectedBuildPacks.length > 0 ? selectedBuildPacks.map((pack) => pack.name) : previewPackNames;
 
   useLayoutEffect(() => {
     const currentOrder = orderedAvailablePacks.map((pack) => pack.id);
@@ -253,9 +269,19 @@ export function ResourcePacksTabSection({
     previousPackOrderRef.current = currentOrder;
   }, [orderedAvailablePacks]);
 
+  useEffect(() => {
+    if (!selectedBuildId || !builderPanelRef.current) return;
+
+    builderPanelRef.current.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  }, [selectedBuildId]);
+
   return (
     <div className="space-y-5 sm:space-y-6">
       <div
+        ref={builderPanelRef}
         className={cn("card relative overflow-hidden transition-all duration-200", resourcePackDragActive && "scale-[1.005] border-brand-500/40")}
         onDragEnter={onResourcePackDragEnter}
         onDragOver={onResourcePackDragOver}
@@ -346,12 +372,32 @@ export function ResourcePacksTabSection({
         <div className="mt-5 grid items-start gap-5 xl:grid-cols-[minmax(0,1.08fr)_minmax(300px,0.92fr)] xl:gap-6">
           <div className="space-y-3">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <h4 className="text-sm font-semibold uppercase tracking-[0.18em] text-surface-300">Available Packs</h4>
+              <div>
+                <h4 className="text-sm font-semibold uppercase tracking-[0.18em] text-surface-300">
+                  {isBuildSelected ? "Selected Build Packs" : "Available Packs"}
+                </h4>
+                <p className="mt-1 text-xs text-surface-500">
+                  {isBuildSelected
+                    ? `Showing packs used in "${selectedBuild?.name}".`
+                    : "These packs are used for the next merged build draft."}
+                </p>
+              </div>
               <div className="flex items-center gap-3">
                 <span className="text-xs text-surface-500">{orderedAvailablePacks.length} total</span>
+                {isBuildSelected && (
+                  <button
+                    type="button"
+                    onClick={clearSelectedBuild}
+                    disabled={actionLoading !== null}
+                    className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 px-3 text-sm"
+                  >
+                    <X size={14} />
+                    Close Selection
+                  </button>
+                )}
               </div>
             </div>
-            {selectedPackIds.length > 0 && (
+            {!isBuildSelected && selectedPackIds.length > 0 && (
               <div className="rounded-2xl border border-brand-500/15 bg-surface-900/65 px-3 py-3 text-xs text-surface-300 shadow-lg shadow-black/10 sm:px-4">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <label className="flex items-center gap-3">
@@ -399,16 +445,16 @@ export function ResourcePacksTabSection({
             <div className="space-y-3">
               {orderedAvailablePacks.length === 0 ? (
                 <div className="rounded-2xl border border-surface-700/70 bg-surface-900/40 px-4 py-8 text-center text-sm text-surface-500">
-                  Add resource packs to start building.
+                  {isBuildSelected ? "This build has no linked source packs." : "Add resource packs to start building."}
                 </div>
               ) : (
                 orderedAvailablePacks.map((pack, index) => {
-                  const isSelected = selectedPackIds.includes(pack.id);
+                  const isSelected = !isBuildSelected && selectedPackIds.includes(pack.id);
                   const isEditing = editingPackId === pack.id;
-                  const canMoveUp = index > 0;
-                  const canMoveDown = index < orderedAvailablePacks.length - 1;
-                  const draggedIndex = draggedPackId ? orderedAvailablePacks.findIndex((item) => item.id === draggedPackId) : -1;
-                  const isDragTarget = dragOverPackId === pack.id && draggedPackId !== pack.id;
+                  const canMoveUp = !isBuildSelected && index > 0;
+                  const canMoveDown = !isBuildSelected && index < orderedAvailablePacks.length - 1;
+                  const draggedIndex = !isBuildSelected && draggedPackId ? orderedAvailablePacks.findIndex((item) => item.id === draggedPackId) : -1;
+                  const isDragTarget = !isBuildSelected && dragOverPackId === pack.id && draggedPackId !== pack.id;
                   const dropDirection = isDragTarget && draggedIndex !== -1 && draggedIndex < index ? "down" : "up";
 
                   return (
@@ -421,17 +467,17 @@ export function ResourcePacksTabSection({
                           packCardRefs.current.delete(pack.id);
                         }
                       }}
-                      onPointerDown={() => handlePackPointerDown(pack.id)}
-                      onPointerEnter={() => handlePackPointerEnter(pack.id)}
-                      onPointerMove={(event) => {
+                      onPointerDown={isBuildSelected ? undefined : () => handlePackPointerDown(pack.id)}
+                      onPointerEnter={isBuildSelected ? undefined : () => handlePackPointerEnter(pack.id)}
+                      onPointerMove={isBuildSelected ? undefined : (event) => {
                         const rect = event.currentTarget.getBoundingClientRect();
                         handlePackPointerMove(pack.id, event.clientY, rect.top, rect.height);
                       }}
                       className={cn(
                         "relative rounded-2xl border px-3 py-3 transition-[background-color,border-color,box-shadow,transform] duration-200 ease-out will-change-transform sm:px-4 sm:py-4",
-                        draggedPackId ? "select-none" : "",
-                        draggedPackId === pack.id && "z-10 scale-[0.985] border-brand-400/35 bg-brand-500/8 shadow-[0_18px_45px_rgba(34,197,94,0.18)] cursor-grabbing",
-                        draggedPackId !== pack.id && "cursor-grab",
+                        !isBuildSelected && draggedPackId ? "select-none" : "",
+                        !isBuildSelected && draggedPackId === pack.id && "z-10 scale-[0.985] border-brand-400/35 bg-brand-500/8 shadow-[0_18px_45px_rgba(34,197,94,0.18)] cursor-grabbing",
+                        !isBuildSelected && draggedPackId !== pack.id && "cursor-grab",
                         isSelected ? "border-red-500/30 bg-red-500/10" : "border-surface-700/70 bg-surface-900/40",
                         isDragTarget && "border-brand-400/40 bg-brand-500/10 shadow-[0_12px_30px_rgba(34,197,94,0.14)]",
                         isDragTarget && dropDirection === "up" && "-translate-y-2",
@@ -447,23 +493,25 @@ export function ResourcePacksTabSection({
                         />
                       )}
                       <div className="flex items-start gap-3">
-                        <button
-                          type="button"
-                          aria-label={isSelected ? "Unselect for delete" : "Select for delete"}
-                          onPointerDown={(event) => event.stopPropagation()}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            togglePackSelection(pack.id);
-                          }}
-                          className={cn(
-                            "mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md border transition-colors",
-                            isSelected
-                              ? "border-brand-400 bg-brand-500/20 text-brand-200"
-                              : "border-surface-700 bg-surface-900/70 text-transparent hover:border-brand-500/40"
-                          )}
-                        >
-                          <Check size={12} />
-                        </button>
+                        {!isBuildSelected && (
+                          <button
+                            type="button"
+                            aria-label={isSelected ? "Unselect for delete" : "Select for delete"}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              togglePackSelection(pack.id);
+                            }}
+                            className={cn(
+                              "mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md border transition-colors",
+                              isSelected
+                                ? "border-brand-400 bg-brand-500/20 text-brand-200"
+                                : "border-surface-700 bg-surface-900/70 text-transparent hover:border-brand-500/40"
+                            )}
+                          >
+                            <Check size={12} />
+                          </button>
+                        )}
                         <div className="h-16 w-16 flex-shrink-0 overflow-hidden rounded-xl border border-surface-700/70 bg-surface-950/80 sm:h-20 sm:w-20 sm:rounded-2xl">
                           <ResourcePackThumbnail
                             src={pack.kind === "pending" ? pack.imagePreviewUrl : pack.imageUrl}
@@ -498,6 +546,11 @@ export function ResourcePacksTabSection({
                             <span className="rounded-full border border-brand-500/25 bg-brand-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-brand-200">
                               Layer {index + 1}
                             </span>
+                            {isBuildSelected && (
+                              <span className="rounded-full border border-surface-700/70 bg-surface-950/70 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-surface-300">
+                                From Selected Build
+                              </span>
+                            )}
                             {isSelected && (
                               <span className="rounded-full border border-red-500/25 bg-red-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-red-200">
                                 Selected For Delete
@@ -515,13 +568,16 @@ export function ResourcePacksTabSection({
                             </span>
                           </div>
                           <p className="mt-2 text-[11px] text-surface-500 sm:mt-3 sm:text-xs">
-                            {isSelected
+                            {isBuildSelected
+                              ? "This pack belongs to the selected merged build. Close selection to manage the full library again."
+                              : isSelected
                               ? "This pack is selected for bulk delete only."
                               : "Drag to reorder and manage this source pack. Its image is read from the pack itself."}
                           </p>
                         </div>
                       </div>
-                      <div className="mt-3 grid grid-cols-2 gap-2 sm:mt-4 sm:flex sm:flex-wrap">
+                      {!isBuildSelected && (
+                        <div className="mt-3 grid grid-cols-2 gap-2 sm:mt-4 sm:flex sm:flex-wrap">
                         <IconTooltip label={isEditing ? "Save name" : "Rename pack"}>
                           <button
                             type="button"
@@ -608,7 +664,8 @@ export function ResourcePacksTabSection({
                             <span className="text-[11px] leading-none sm:hidden">Down</span>
                           </button>
                         </IconTooltip>
-                      </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })
@@ -617,124 +674,263 @@ export function ResourcePacksTabSection({
           </div>
 
           <div className="self-start rounded-2xl border border-surface-700/70 bg-surface-900/35 p-4 sm:p-5">
-            <h4 className="text-sm font-semibold uppercase tracking-[0.18em] text-surface-300">Build Pack</h4>
-            <p className="mt-1 text-sm text-surface-400">
-              All available packs are merged from top to bottom. Lower packs override earlier ones when they contain the same file path.
-            </p>
-            <p className="mt-2 text-xs text-surface-500">
-              {orderedAvailablePacks.length > 0
-                ? `${orderedAvailablePacks.length} pack${orderedAvailablePacks.length > 1 ? "s are" : " is"} ready to build`
-                : "No packs uploaded yet."}
-            </p>
+            {selectedBuild ? (
+              <>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h4 className="text-sm font-semibold uppercase tracking-[0.18em] text-surface-300">Merged Resource Pack Builder</h4>
+                    <p className="mt-1 text-sm text-surface-400">
+                      Selected build is loaded here for editing. Close selection to return to a blank builder for a new merged pack.
+                    </p>
+                  </div>
+                  {selectedBuild.assignedToServer && (
+                    <span className="rounded-full border border-brand-500/25 bg-brand-500/10 px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] text-brand-200">
+                      Assigned To Server
+                    </span>
+                  )}
+                </div>
 
-            <div className="mt-4 space-y-4">
-              <div>
-                <label className="mb-1.5 block text-sm font-medium text-surface-300">Build Name</label>
-                <input
-                  type="text"
-                  value={buildName}
-                  onChange={(event) => setBuildName(event.target.value)}
-                  placeholder={`${serverName}-resource-pack`}
-                  className="input-field w-full"
-                />
-              </div>
-
-              <div>
-                <label className="mb-1.5 block text-sm font-medium text-surface-300">Build Description</label>
-                <textarea
-                  value={buildDescription}
-                  onChange={(event) => setBuildDescription(event.target.value)}
-                  placeholder="Optional description for this merged build"
-                  rows={3}
-                  className="input-field w-full resize-y py-3"
-                />
-              </div>
-
-              <div>
-                <label className="mb-1.5 block text-sm font-medium text-surface-300">Merged Pack Image</label>
-                <div className="flex flex-col gap-3 rounded-2xl border border-surface-700/70 bg-surface-950/40 p-3 sm:flex-row sm:items-start">
-                  <div className="h-16 w-16 flex-shrink-0 overflow-hidden rounded-xl border border-surface-700/70 bg-surface-950/80 sm:h-20 sm:w-20 sm:rounded-2xl">
-                    <ResourcePackThumbnail
-                      src={buildImagePreviewUrl}
-                      alt="Merged pack image preview"
+                <div className="mt-4 space-y-4">
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-surface-300">Build Name</label>
+                    <input
+                      type="text"
+                      value={editingBuildId === selectedBuild.id ? editingBuildName : selectedBuild.name}
+                      onChange={(event) => setEditingBuildName(event.target.value)}
+                      disabled={editingBuildId !== selectedBuild.id}
+                      className="input-field w-full disabled:opacity-70"
                     />
                   </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm text-surface-300">
-                      {buildImageFile
-                        ? "Custom image selected for the next merged pack build."
-                        : "Use the merged result image by default, or choose a custom image for the next build."}
-                    </p>
-                    <div className="mt-3 grid grid-cols-1 gap-2 sm:flex sm:flex-wrap">
+
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-surface-300">Build Description</label>
+                    <textarea
+                      value={editingBuildId === selectedBuild.id ? editingBuildDescription : (selectedBuild.description ?? "")}
+                      onChange={(event) => setEditingBuildDescription(event.target.value)}
+                      disabled={editingBuildId !== selectedBuild.id}
+                      rows={3}
+                      className="input-field w-full resize-y py-3 disabled:opacity-70"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-surface-300">Merged Pack Image</label>
+                    <div className="flex flex-col gap-3 rounded-2xl border border-surface-700/70 bg-surface-950/40 p-3 sm:flex-row sm:items-start">
+                      <div className="h-16 w-16 flex-shrink-0 overflow-hidden rounded-xl border border-surface-700/70 bg-surface-950/80 sm:h-20 sm:w-20 sm:rounded-2xl">
+                        <ResourcePackThumbnail
+                          src={selectedBuild.imageUrl}
+                          alt={`${selectedBuild.name} merged pack image`}
+                        />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm text-surface-300">
+                          {selectedBuild.imageUrl ? "This image is stored on the merged pack and can be replaced here." : "No image is stored on this build yet."}
+                        </p>
+                        <div className="mt-3 grid grid-cols-1 gap-2 sm:flex sm:flex-wrap">
+                          <button
+                            type="button"
+                            onClick={() => openBuildImagePicker(selectedBuild.id)}
+                            disabled={actionLoading !== null}
+                            className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
+                          >
+                            <ImageIcon size={14} />
+                            {actionLoading === "updatePackImage" ? "Updating..." : "Edit Image"}
+                          </button>
+                          <a
+                            href={selectedBuild.publicUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
+                          >
+                            <Link2 size={14} />
+                            Open Link
+                          </a>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-2 text-xs text-surface-400 sm:grid-cols-2">
+                    <div className="rounded-xl border border-surface-800/80 bg-surface-950/45 px-3 py-2">
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-surface-500">Public Link</p>
+                      <p className="mt-1 break-all font-mono text-brand-200">{selectedBuild.publicUrl}</p>
+                    </div>
+                    <div className="rounded-xl border border-surface-800/80 bg-surface-950/45 px-3 py-2">
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-surface-500">Build Info</p>
+                      <p className="mt-1">Size: {formatBytes(selectedBuild.sizeBytes)}</p>
+                      <p className="mt-1 break-all font-mono">SHA1: {selectedBuild.sha1}</p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleAssignBuild(selectedBuild.id)}
+                      disabled={actionLoading !== null}
+                      className="btn-primary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
+                    >
+                      {actionLoading === "assignPack" ? "Assigning..." : selectedBuild.assignedToServer ? "Reassign To Server" : "Assign To Server"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (editingBuildId === selectedBuild.id) {
+                          void handleRenameBuild(selectedBuild);
+                          return;
+                        }
+                        startEditingBuild(selectedBuild);
+                      }}
+                      disabled={actionLoading !== null}
+                      className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
+                    >
+                      {editingBuildId === selectedBuild.id ? <Save size={14} /> : <Pencil size={14} />}
+                      {editingBuildId === selectedBuild.id ? "Save Changes" : "Edit Details"}
+                    </button>
+                    {editingBuildId === selectedBuild.id && (
                       <button
                         type="button"
-                        onClick={openDraftBuildImagePicker}
+                        onClick={cancelEditingBuild}
                         disabled={actionLoading !== null}
                         className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
                       >
-                        <ImageIcon size={14} />
-                        {buildImageFile ? "Change Build Image" : "Set Build Image"}
+                        <X size={14} />
+                        Cancel
                       </button>
-                      {buildImageFile && (
-                        <button
-                          type="button"
-                          onClick={clearDraftBuildImage}
-                          disabled={actionLoading !== null}
-                          className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
-                        >
-                          <X size={14} />
-                          Clear
-                        </button>
-                      )}
-                    </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setDeleteBuildConfirm(selectedBuild)}
+                      disabled={actionLoading !== null}
+                      className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 border-red-500/20 bg-red-500/10 text-sm text-red-200 hover:bg-red-500/20"
+                    >
+                      <Trash2 size={14} />
+                      {actionLoading === "deleteBuild" ? "Deleting..." : "Delete Build"}
+                    </button>
                   </div>
                 </div>
-              </div>
+              </>
+            ) : (
+              <>
+                <h4 className="text-sm font-semibold uppercase tracking-[0.18em] text-surface-300">Build Pack</h4>
+                <p className="mt-1 text-sm text-surface-400">
+                  All available packs are merged from top to bottom. Lower packs override earlier ones when they contain the same file path.
+                </p>
+                <p className="mt-2 text-xs text-surface-500">
+                  {orderedLibraryPacks.length > 0
+                    ? `${orderedLibraryPacks.length} pack${orderedLibraryPacks.length > 1 ? "s are" : " is"} ready to build`
+                    : "No packs uploaded yet."}
+                </p>
 
-              <p className="text-xs text-surface-500">
-                Configure prompt, require-resource-pack, and other server properties in the Properties tab.
-              </p>
+                <div className="mt-4 space-y-4">
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-surface-300">Build Name</label>
+                    <input
+                      type="text"
+                      value={buildName}
+                      onChange={(event) => setBuildName(event.target.value)}
+                      placeholder={`${serverName}-resource-pack`}
+                      className="input-field w-full"
+                    />
+                  </div>
 
-              <button
-                type="button"
-                onClick={() => void handleBuildMergedPack()}
-                disabled={orderedAvailablePacks.length === 0 || actionLoading !== null}
-                className="btn-primary flex w-full items-center justify-center gap-2"
-              >
-                <WandSparkles size={15} />
-                {actionLoading === "buildPack" ? "Building..." : "Build Merged Pack"}
-              </button>
-            </div>
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-surface-300">Build Description</label>
+                    <textarea
+                      value={buildDescription}
+                      onChange={(event) => setBuildDescription(event.target.value)}
+                      placeholder="Optional description for this merged build"
+                      rows={3}
+                      className="input-field w-full resize-y py-3"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-surface-300">Merged Pack Image</label>
+                    <div className="flex flex-col gap-3 rounded-2xl border border-surface-700/70 bg-surface-950/40 p-3 sm:flex-row sm:items-start">
+                      <div className="h-16 w-16 flex-shrink-0 overflow-hidden rounded-xl border border-surface-700/70 bg-surface-950/80 sm:h-20 sm:w-20 sm:rounded-2xl">
+                        <ResourcePackThumbnail
+                          src={buildImagePreviewUrl}
+                          alt="Merged pack image preview"
+                        />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm text-surface-300">
+                          {buildImageFile
+                            ? "Custom image selected for the next merged pack build."
+                            : "Use the merged result image by default, or choose a custom image for the next build."}
+                        </p>
+                        <div className="mt-3 grid grid-cols-1 gap-2 sm:flex sm:flex-wrap">
+                          <button
+                            type="button"
+                            onClick={openDraftBuildImagePicker}
+                            disabled={actionLoading !== null}
+                            className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
+                          >
+                            <ImageIcon size={14} />
+                            {buildImageFile ? "Change Build Image" : "Set Build Image"}
+                          </button>
+                          {buildImageFile && (
+                            <button
+                              type="button"
+                              onClick={clearDraftBuildImage}
+                              disabled={actionLoading !== null}
+                              className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
+                            >
+                              <X size={14} />
+                              Clear
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-surface-500">
+                    Configure prompt, require-resource-pack, and other server properties in the Properties tab.
+                  </p>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleBuildMergedPack()}
+                    disabled={orderedLibraryPacks.length === 0 || actionLoading !== null}
+                    className="btn-primary flex w-full items-center justify-center gap-2"
+                  >
+                    <WandSparkles size={15} />
+                    {actionLoading === "buildPack" ? "Building..." : "Build Merged Pack"}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
 
-        {(previewPackNames.length > 0 || previewConflicts.length > 0) && (
+        {(activePackPreviewNames.length > 0 || activeConflictPreview.length > 0) && (
           <div className="mt-6 rounded-2xl border border-surface-700/70 bg-surface-900/35 p-4">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h4 className="text-sm font-semibold uppercase tracking-[0.18em] text-surface-300">Merge Preview</h4>
                 <p className="mt-1 break-words text-sm text-surface-400">
-                  Build order: {previewPackNames.join(" > ") || "Selected packs"}
+                  Build order: {activePackPreviewNames.join(" > ") || "Selected packs"}
                 </p>
               </div>
               <span
                 className={cn(
                   "rounded-full px-2.5 py-1 text-xs font-medium",
-                  previewConflicts.length > 0
+                  activeConflictPreview.length > 0
                     ? "border border-amber-500/25 bg-amber-500/10 text-amber-200"
                     : "border border-emerald-500/25 bg-emerald-500/10 text-emerald-200"
                 )}
               >
-                {previewConflicts.length > 0
-                  ? `${previewConflicts.length} override${previewConflicts.length > 1 ? "s" : ""}`
+                {activeConflictPreview.length > 0
+                  ? `${activeConflictPreview.length} override${activeConflictPreview.length > 1 ? "s" : ""}`
                   : "No file overrides"}
               </span>
             </div>
 
-            {previewConflicts.length > 0 && (
+            {activeConflictPreview.length > 0 && (
               <div className="mt-4 max-h-64 overflow-y-auto rounded-xl border border-surface-800 bg-surface-950/60 p-3">
                 <div className="space-y-2">
-                  {previewConflicts.map((conflictPath) => (
+                  {activeConflictPreview.map((conflictPath) => (
                     <div key={conflictPath} className="font-mono text-xs text-surface-300">
                       {conflictPath}
                     </div>
@@ -768,167 +964,103 @@ export function ResourcePacksTabSection({
             resourcePackBuilds.map((build) => (
               <div
                 key={build.id}
+                onClick={() => {
+                  void selectBuild(build.id);
+                }}
                 className={cn(
-                  "rounded-2xl border bg-surface-900/40 p-3 sm:p-4",
-                  build.assignedToServer ? "border-brand-500/25 shadow-[0_0_0_1px_rgba(34,197,94,0.08)]" : "border-surface-700/70"
+                  "rounded-2xl border bg-surface-900/40 p-3 transition-[border-color,box-shadow,transform,background-color] duration-200 sm:p-4",
+                  actionLoading === null && "cursor-pointer hover:-translate-y-0.5 hover:border-cyan-400/30 hover:bg-surface-900/60",
+                  selectedBuildId === build.id
+                    ? "border-cyan-300/70 bg-cyan-500/10 shadow-[0_0_0_1px_rgba(34,211,238,0.35),0_20px_50px_rgba(8,145,178,0.18)]"
+                    : build.assignedToServer
+                      ? "border-brand-500/25 shadow-[0_0_0_1px_rgba(34,197,94,0.08)]"
+                      : "border-surface-700/70"
                 )}
               >
                 <div className="flex flex-col gap-4">
-                  <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                    <div className="min-w-0 flex flex-1 items-start gap-3 sm:gap-4">
-                      <div className="h-16 w-16 flex-shrink-0 overflow-hidden rounded-xl border border-surface-700/70 bg-surface-950/80 sm:h-20 sm:w-20 sm:rounded-2xl">
-                        <ResourcePackThumbnail
-                          src={build.imageUrl}
-                          alt={`${build.name} merged pack image`}
-                          iconSize={22}
-                        />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          {editingBuildId === build.id ? (
-                            <div className="min-w-0 w-full max-w-full flex-1 space-y-2 sm:min-w-[280px]">
-                              <input
-                                type="text"
-                                value={editingBuildName}
-                                autoFocus
-                                onChange={(event) => setEditingBuildName(event.target.value)}
-                                onKeyDown={(event) => {
-                                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-                                    event.preventDefault();
-                                    void handleRenameBuild(build);
-                                  }
-                                  if (event.key === "Escape") {
-                                    event.preventDefault();
-                                    cancelEditingBuild();
-                                  }
-                                }}
-                                className="input-field h-9 min-w-0 w-full max-w-full py-1.5 text-sm"
-                              />
-                              <textarea
-                                value={editingBuildDescription}
-                                onChange={(event) => setEditingBuildDescription(event.target.value)}
-                                rows={3}
-                                placeholder="Optional description for this merged build"
-                                className="input-field w-full resize-y py-2 text-sm"
-                              />
-                            </div>
-                          ) : (
-                            <h4 className="line-clamp-2 break-words text-sm font-semibold text-surface-100 sm:text-base">
-                              {build.name}
-                            </h4>
-                          )}
-                          <span className="rounded-full border border-surface-700/70 bg-surface-950/70 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-surface-400">
-                            {build.packCount} packs
-                          </span>
-                          {build.assignedToServer && (
-                            <span className="rounded-full border border-brand-500/25 bg-brand-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-brand-200">
-                              Active on server
-                            </span>
-                          )}
-                          {build.conflictCount > 0 && (
-                            <span className="rounded-full border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-amber-200">
-                              {build.conflictCount} overrides
-                            </span>
-                          )}
-                        </div>
-
-                        {!editingBuildId && build.description ? (
-                          <p className="mt-2 text-sm text-surface-300">{build.description}</p>
-                        ) : null}
-
-                        <div className="mt-3 grid gap-2 text-xs text-surface-400 sm:grid-cols-2">
-                          <div className="rounded-xl border border-surface-800/80 bg-surface-950/45 px-3 py-2">
-                            <p className="text-[10px] uppercase tracking-[0.18em] text-surface-500">Public Link</p>
-                            <p className="mt-1 break-all font-mono text-brand-200">{build.publicUrl}</p>
-                          </div>
-                          <div className="rounded-xl border border-surface-800/80 bg-surface-950/45 px-3 py-2">
-                            <p className="text-[10px] uppercase tracking-[0.18em] text-surface-500">Build Info</p>
-                            <p className="mt-1">Size: {formatBytes(build.sizeBytes)}</p>
-                            <p className="mt-1 break-all font-mono">SHA1: {build.sha1}</p>
-                          </div>
-                        </div>
-                      </div>
+                  <div className="min-w-0 flex flex-1 items-start gap-3 sm:gap-4">
+                    <div className="h-16 w-16 flex-shrink-0 overflow-hidden rounded-xl border border-surface-700/70 bg-surface-950/80 sm:h-20 sm:w-20 sm:rounded-2xl">
+                      <ResourcePackThumbnail
+                        src={build.imageUrl}
+                        alt={`${build.name} merged pack image`}
+                        iconSize={22}
+                      />
                     </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h4 className="line-clamp-2 break-words text-sm font-semibold text-surface-100 sm:text-base">
+                          {build.name}
+                        </h4>
+                        <span className="rounded-full border border-surface-700/70 bg-surface-950/70 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-surface-400">
+                          {build.packCount} packs
+                        </span>
+                        {selectedBuildId === build.id && (
+                          <span className="rounded-full border border-cyan-300/40 bg-cyan-400/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-cyan-100">
+                            Selected For Edit
+                          </span>
+                        )}
+                        {build.assignedToServer && (
+                          <span className="rounded-full border border-brand-500/25 bg-brand-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-brand-200">
+                            Active on server
+                          </span>
+                        )}
+                        {build.conflictCount > 0 && (
+                          <span className="rounded-full border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-amber-200">
+                            {build.conflictCount} overrides
+                          </span>
+                        )}
+                      </div>
 
-                    <div className="rounded-2xl border border-surface-800/80 bg-surface-950/45 p-3 lg:w-[250px]">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-surface-500">Media</p>
-                      <p className="mt-2 text-sm text-surface-300">
-                        {build.imageUrl ? "Merged image is ready and can be replaced." : "No merged image found in this build yet."}
-                      </p>
-                      <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-1">
-                        <button
-                          type="button"
-                          onClick={() => openBuildImagePicker(build.id)}
-                          disabled={actionLoading !== null}
-                          className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
-                        >
-                          <ImageIcon size={14} />
-                          {actionLoading === "updatePackImage" ? "Updating..." : "Edit Image"}
-                        </button>
-                        <a
-                          href={build.publicUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
-                        >
-                          <Link2 size={14} />
-                          Open Link
-                        </a>
+                      {build.description ? (
+                        <p className="mt-2 text-sm text-surface-300">{build.description}</p>
+                      ) : null}
+
+                      <div className="mt-3 grid gap-2 text-xs text-surface-400 sm:grid-cols-2">
+                        <div className="rounded-xl border border-surface-800/80 bg-surface-950/45 px-3 py-2">
+                          <p className="text-[10px] uppercase tracking-[0.18em] text-surface-500">Public Link</p>
+                          <p className="mt-1 break-all font-mono text-brand-200">{build.publicUrl}</p>
+                        </div>
+                        <div className="rounded-xl border border-surface-800/80 bg-surface-950/45 px-3 py-2">
+                          <p className="text-[10px] uppercase tracking-[0.18em] text-surface-500">Build Info</p>
+                          <p className="mt-1">Size: {formatBytes(build.sizeBytes)}</p>
+                          <p className="mt-1 break-all font-mono">SHA1: {build.sha1}</p>
+                        </div>
                       </div>
                     </div>
                   </div>
 
                   <div className="border-t border-surface-800/80 pt-3">
-                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
-                      <button
-                        type="button"
-                        onClick={() => void handleAssignBuild(build.id)}
-                        disabled={actionLoading !== null}
-                        className="btn-primary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
-                      >
-                        {actionLoading === "assignPack" ? "Assigning..." : build.assignedToServer ? "Reassign To Server" : "Assign To Server"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (editingBuildId === build.id) {
-                            void handleRenameBuild(build);
-                            return;
-                          }
-                          startEditingBuild(build);
-                        }}
-                        disabled={actionLoading !== null}
-                        className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
-                      >
-                        {editingBuildId === build.id ? <Save size={14} /> : <Pencil size={14} />}
-                        {actionLoading === "renameBuild"
-                          ? "Saving..."
-                          : editingBuildId === build.id
-                            ? "Save Changes"
-                            : "Edit Details"}
-                      </button>
-                      {editingBuildId === build.id ? (
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <p className="text-xs text-surface-500">
+                        {selectedBuildId === build.id
+                          ? "Selected now. Edit image and details in the builder above."
+                          : "Click this card to load it into the builder above."}
+                      </p>
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                         <button
                           type="button"
-                          onClick={cancelEditingBuild}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleAssignBuild(build.id);
+                          }}
                           disabled={actionLoading !== null}
-                          className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 text-sm"
+                          className="btn-primary inline-flex min-h-10 items-center justify-center gap-2 px-5 text-sm sm:min-w-[220px]"
                         >
-                          <X size={14} />
-                          Cancel
+                          {actionLoading === "assignPack" ? "Assigning..." : build.assignedToServer ? "Reassign To Server" : "Assign To Server"}
                         </button>
-                      ) : (
-                        <div className="hidden xl:block" />
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => setDeleteBuildConfirm(build)}
-                        disabled={actionLoading !== null}
-                        className="btn-secondary inline-flex min-h-10 items-center justify-center gap-2 border-red-500/20 bg-red-500/10 text-sm text-red-200 hover:bg-red-500/20"
-                      >
-                        <Trash2 size={14} />
-                        {actionLoading === "deleteBuild" ? "Deleting..." : "Delete Build"}
-                      </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setDeleteBuildConfirm(build);
+                          }}
+                          disabled={actionLoading !== null}
+                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-red-500/20 bg-red-500/8 px-4 text-sm font-medium text-red-200 transition-all duration-200 hover:border-red-400/30 hover:bg-red-500/14 disabled:opacity-60"
+                        >
+                          <Trash2 size={14} />
+                          {actionLoading === "deleteBuild" ? "Deleting..." : "Delete"}
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>

@@ -6,6 +6,7 @@ interface FilesTabSectionProps {
   editingFile: string | null;
   onEditFile: (path: string) => void;
   onCloseEditor: () => void;
+  onServerFilesChanged?: () => void;
 }
 
 export function FilesTabSection({
@@ -13,6 +14,7 @@ export function FilesTabSection({
   editingFile,
   onEditFile,
   onCloseEditor,
+  onServerFilesChanged,
 }: FilesTabSectionProps) {
   return (
     <div className="card">
@@ -22,6 +24,7 @@ export function FilesTabSection({
             serverId={serverId}
             filePath={editingFile}
             onClose={onCloseEditor}
+            onServerFilesChanged={onServerFilesChanged}
           />
         </div>
       ) : (
@@ -30,6 +33,7 @@ export function FilesTabSection({
           <FileBrowser
             serverId={serverId}
             onEditFile={onEditFile}
+            onServerFilesChanged={onServerFilesChanged}
           />
         </>
       )}

@@ -7,9 +7,10 @@ interface FileEditorProps {
     serverId: string;
     filePath: string;
     onClose: () => void;
+    onServerFilesChanged?: () => void;
 }
 
-export function FileEditor({ serverId, filePath, onClose }: FileEditorProps) {
+export function FileEditor({ serverId, filePath, onClose, onServerFilesChanged }: FileEditorProps) {
     const [content, setContent] = useState("");
     const [originalContent, setOriginalContent] = useState("");
     const [loading, setLoading] = useState(true);
@@ -40,6 +41,7 @@ export function FileEditor({ serverId, filePath, onClose }: FileEditorProps) {
             setOriginalContent(content);
             setSaved(true);
             setTimeout(() => setSaved(false), 2000);
+            onServerFilesChanged?.();
         } catch (err) {
             console.error("Failed to save:", err);
         } finally {

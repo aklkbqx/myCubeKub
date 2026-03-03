@@ -12,6 +12,7 @@ import SelectDropdown from "./SelectDropdown";
 interface FileBrowserProps {
     serverId: string;
     onEditFile: (path: string) => void;
+    onServerFilesChanged?: () => void;
 }
 
 type FileDeleteConfirmState =
@@ -64,7 +65,7 @@ const FILE_SORT_OPTIONS = [
     { value: "size-asc", label: "Smallest first" },
 ] as const;
 
-export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
+export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: FileBrowserProps) {
     const [currentPath, setCurrentPath] = useState("");
     const [files, setFiles] = useState<FileInfo[]>([]);
     const [loading, setLoading] = useState(true);
@@ -162,6 +163,7 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
             await api.files.mkdir(serverId, path);
             setNewFolderName("");
             setShowNewFolder(false);
+            onServerFilesChanged?.();
             void fetchFiles();
         } catch (err: any) {
             setError(err.message || "Failed to create folder.");
@@ -172,6 +174,7 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
         setError("");
         try {
             await api.files.delete(serverId, file.path);
+            onServerFilesChanged?.();
             void fetchFiles();
         } catch (err: any) {
             setError(err.message || "Failed to delete item.");
@@ -189,6 +192,7 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
         try {
             await api.files.rename(serverId, file.path, newPath);
             setRenamingFile(null);
+            onServerFilesChanged?.();
             void fetchFiles();
         } catch (err: any) {
             setError(err.message || "Failed to rename item.");
@@ -246,6 +250,7 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
                 }, 8000);
             }
 
+            onServerFilesChanged?.();
             await fetchFiles();
         } catch (err: any) {
             setError(err.message || "Failed to upload file.");
@@ -413,6 +418,7 @@ export function FileBrowser({ serverId, onEditFile }: FileBrowserProps) {
             await Promise.all(
                 items.map((file) => api.files.delete(serverId, file.path))
             );
+            onServerFilesChanged?.();
             setSelectedPaths([]);
             await fetchFiles();
         } catch (err: any) {

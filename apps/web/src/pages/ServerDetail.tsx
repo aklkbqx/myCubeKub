@@ -58,6 +58,7 @@ export function ServerDetail() {
     const [activeTab, setActiveTab] = useState<ServerDetailTab>("settings");
     const [serverStatus, setServerStatus] = useState<string | undefined>(undefined);
     const [serverCreatedAt, setServerCreatedAt] = useState<string | undefined>(undefined);
+    const [serverRestartNotice, setServerRestartNotice] = useState("");
 
     // File editor
     const [editingFile, setEditingFile] = useState<string | null>(null);
@@ -128,6 +129,7 @@ export function ServerDetail() {
         serverCreatedAt,
         setActionError,
         setActionLoading,
+        setRestartNotice: setServerRestartNotice,
     });
 
     const {
@@ -190,6 +192,8 @@ export function ServerDetail() {
         resourcePackDragActive,
         resourcePackInputRef,
         resourcePackImageInputRef,
+        selectedBuildId,
+        selectedBuildDetail,
         selectedPackIds,
         setSelectedPackIds,
         editingPackId,
@@ -211,6 +215,7 @@ export function ServerDetail() {
         previewPackNames,
         previewConflicts,
         orderedAvailablePacks,
+        orderedLibraryPacks,
         allAvailablePacksSelected,
         fetchResourcePackData,
         handleUploadResourcePack,
@@ -232,6 +237,8 @@ export function ServerDetail() {
         handlePackPointerMove,
         handleDeleteSelectedPacks,
         handleBuildMergedPack,
+        selectBuild,
+        clearSelectedBuild,
         handleAssignBuild,
         handleConfirmResourcePackAction,
         startEditingPack,
@@ -243,10 +250,12 @@ export function ServerDetail() {
     } = useResourcePacks({
         serverId: id,
         serverName: server?.name,
+        serverStatus: server?.status,
         activeTab,
         fetchProperties,
         setActionError,
         setActionLoading,
+        setRestartNotice: setServerRestartNotice,
     });
 
     useEffect(() => {
@@ -361,6 +370,9 @@ export function ServerDetail() {
         setActionLoading(action);
         try {
             await fn();
+            if (action === "restart") {
+                setServerRestartNotice("");
+            }
             await fetchServer();
         } catch (err: any) {
             setActionError(err.message || `Failed to ${action}`);
@@ -410,6 +422,7 @@ export function ServerDetail() {
     };
 
     const hasUnsavedChanges = hasUnsavedSettings || hasPendingServerIcon || hasUnsavedProperties;
+    const effectiveRestartNotice = serverRestartNotice || restartNotice;
 
     const {
         unsavedChangesConfirm,
@@ -458,6 +471,7 @@ export function ServerDetail() {
                 server={server}
                 connectionAddress={connectionAddress}
                 connectionCopied={connectionCopied}
+                restartNotice={effectiveRestartNotice}
                 mobileHeaderOpen={mobileHeaderOpen}
                 setMobileHeaderOpen={setMobileHeaderOpen}
                 handleBackNavigation={handleBackNavigation}
@@ -484,6 +498,11 @@ export function ServerDetail() {
                 {actionError && (
                     <div className="mb-6 rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-300">
                         {actionError}
+                    </div>
+                )}
+                {effectiveRestartNotice && (
+                    <div className="mb-6 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                        {effectiveRestartNotice}
                     </div>
                 )}
                 {/* Settings Tab */}
@@ -573,7 +592,10 @@ export function ServerDetail() {
                         handleBuildImageSelected={handleBuildImageInputForEditor}
                         resourcePackNotice={resourcePackNotice}
                         resourcePackProgress={resourcePackProgress}
+                        selectedBuildId={selectedBuildId}
+                        selectedBuildDetail={selectedBuildDetail}
                         orderedAvailablePacks={orderedAvailablePacks}
+                        orderedLibraryPacks={orderedLibraryPacks}
                         selectedPackIds={selectedPackIds}
                         toggleSelectAllPacks={toggleSelectAllPacks}
                         allAvailablePacksSelected={allAvailablePacksSelected}
@@ -605,6 +627,8 @@ export function ServerDetail() {
                         handleBuildMergedPack={handleBuildMergedPack}
                         previewPackNames={previewPackNames}
                         previewConflicts={previewConflicts}
+                        selectBuild={selectBuild}
+                        clearSelectedBuild={clearSelectedBuild}
                         resourcePackBuilds={resourcePackBuilds}
                         editingBuildId={editingBuildId}
                         editingBuildName={editingBuildName}
@@ -627,6 +651,11 @@ export function ServerDetail() {
                         editingFile={editingFile}
                         onEditFile={(path) => setEditingFile(path)}
                         onCloseEditor={() => setEditingFile(null)}
+                        onServerFilesChanged={() => {
+                            if (server.status === "running") {
+                                setServerRestartNotice("Server files changed. Restart the server to apply the new files or edits to the running server.");
+                            }
+                        }}
                     />
                 )}
 

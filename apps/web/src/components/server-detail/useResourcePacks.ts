@@ -1,25 +1,35 @@
-import { type ChangeEvent, type Dispatch, type DragEvent, type MutableRefObject, type SetStateAction, useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, api, type ResourcePackBuildInfo, type ResourcePackInfo } from "@/lib/api";
+import { type ChangeEvent, type Dispatch, type DragEvent, type SetStateAction, useCallback, useEffect, useRef, useState } from "react";
+import { ApiError, api, type ResourcePackBuildDetail, type ResourcePackBuildInfo, type ResourcePackInfo } from "@/lib/api";
 import { extractPackImagePreviewFromZip, resizeResourcePackImage } from "@/components/server-detail/resource-pack-utils";
 import type { AvailableResourcePack, PendingResourcePack, ResourcePackConfirmState } from "@/components/server-detail/server-detail-types";
 
 type UseResourcePacksOptions = {
   serverId?: string;
   serverName?: string;
+  serverStatus?: string;
   activeTab: string;
   fetchProperties: () => Promise<void>;
   setActionError: Dispatch<SetStateAction<string>>;
   setActionLoading: Dispatch<SetStateAction<string | null>>;
+  setRestartNotice: Dispatch<SetStateAction<string>>;
 };
 
 export function useResourcePacks({
   serverId,
   serverName,
+  serverStatus,
   activeTab,
   fetchProperties,
   setActionError,
   setActionLoading,
+  setRestartNotice,
 }: UseResourcePacksOptions) {
+  const normalizeBuildDetail = useCallback((detail: ResourcePackBuildDetail): ResourcePackBuildDetail => ({
+    build: detail.build,
+    packs: Array.isArray(detail.packs) ? detail.packs : [],
+    conflicts: Array.isArray(detail.conflicts) ? detail.conflicts : [],
+  }), []);
+
   const [resourcePacks, setResourcePacks] = useState<ResourcePackInfo[]>([]);
   const [resourcePackBuilds, setResourcePackBuilds] = useState<ResourcePackBuildInfo[]>([]);
   const [resourcePacksLoaded, setResourcePacksLoaded] = useState(false);
@@ -30,6 +40,8 @@ export function useResourcePacks({
   const [editingBuildId, setEditingBuildId] = useState<string | null>(null);
   const [editingBuildName, setEditingBuildName] = useState("");
   const [editingBuildDescription, setEditingBuildDescription] = useState("");
+  const [selectedBuildId, setSelectedBuildId] = useState<string | null>(null);
+  const [selectedBuildDetail, setSelectedBuildDetail] = useState<ResourcePackBuildDetail | null>(null);
   const [packOrderIds, setPackOrderIds] = useState<string[]>([]);
   const [buildName, setBuildName] = useState("");
   const [buildDescription, setBuildDescription] = useState("");
@@ -57,6 +69,24 @@ export function useResourcePacks({
     pendingPackPreviewUrlsRef.current.delete(previewUrl);
   }, []);
 
+  const clearBuildDraft = useCallback(() => {
+    setBuildName("");
+    setBuildDescription("");
+    setPreviewConflicts([]);
+    setPreviewPackNames([]);
+  }, []);
+
+  const refreshSelectedBuildDetail = useCallback(async (buildId: string | null) => {
+    if (!serverId || !buildId) {
+      setSelectedBuildDetail(null);
+      return null;
+    }
+
+    const detail = normalizeBuildDetail(await api.resourcePacks.getBuild(serverId, buildId));
+    setSelectedBuildDetail(detail);
+    return detail;
+  }, [normalizeBuildDetail, serverId]);
+
   const fetchResourcePackData = useCallback(async () => {
     if (!serverId) return;
     setResourcePacksLoaded(false);
@@ -67,14 +97,23 @@ export function useResourcePacks({
       ]);
       setResourcePacks(packs);
       setResourcePackBuilds(builds);
+      if (selectedBuildId) {
+        if (builds.some((build) => build.id === selectedBuildId)) {
+          await refreshSelectedBuildDetail(selectedBuildId);
+        } else {
+          setSelectedBuildId(null);
+          setSelectedBuildDetail(null);
+        }
+      }
     } catch (err: any) {
       setResourcePacks([]);
       setResourcePackBuilds([]);
+      setSelectedBuildDetail(null);
       setActionError(err.message || "Failed to load resource pack library");
     } finally {
       setResourcePacksLoaded(true);
     }
-  }, [serverId, setActionError]);
+  }, [refreshSelectedBuildDetail, selectedBuildId, serverId, setActionError]);
 
   const queueResourcePackFiles = useCallback(async (fileList: FileList | File[]) => {
     const uploadableFiles = Array.from(fileList).filter((file) => file.name.toLowerCase().endsWith(".zip"));
@@ -110,6 +149,7 @@ export function useResourcePacks({
     setActionError("");
     setResourcePackNotice("");
     setPendingResourcePacks((current) => [...current, ...pendingItems]);
+    setPackOrderIds((current) => [...current, ...pendingItems.map((item) => item.id)]);
     setResourcePackNotice(
       `${uploadableFiles.length} resource pack${uploadableFiles.length > 1 ? "s added." : " added."}`
     );
@@ -237,11 +277,14 @@ export function useResourcePacks({
     try {
       const { build } = await api.resourcePacks.updateBuildImage(targetBuildId, file);
       setResourcePackBuilds((current) => current.map((item) => (item.id === build.id ? build : item)));
+      if (selectedBuildId === build.id) {
+        await refreshSelectedBuildDetail(build.id);
+      }
       setResourcePackNotice(`Updated merged pack image for "${build.name}".`);
     } finally {
       setActionLoading(null);
     }
-  }, [replaceDraftBuildImagePreview, setActionLoading]);
+  }, [refreshSelectedBuildDetail, replaceDraftBuildImagePreview, selectedBuildId, setActionLoading]);
 
   const consumeBuildImageSelectionTarget = useCallback(() => {
     const targetBuildId = buildImageTargetRef.current;
@@ -417,6 +460,8 @@ export function useResourcePacks({
       setPackOrderIds((current) => current.filter((currentId) => !removablePackIds.has(currentId)));
       setPreviewConflicts([]);
       setPreviewPackNames([]);
+      setSelectedBuildId(null);
+      setSelectedBuildDetail(null);
       await fetchResourcePackData();
 
       const deletedCount = removablePackIds.size;
@@ -465,6 +510,8 @@ export function useResourcePacks({
       setPackOrderIds((current) => current.filter((id) => id !== pack.id));
       setPreviewConflicts([]);
       setPreviewPackNames([]);
+      setSelectedBuildId(null);
+      setSelectedBuildDetail(null);
       setResourcePackNotice(
         pack.kind === "stored"
           ? `Deleted resource pack "${pack.name}".`
@@ -485,6 +532,13 @@ export function useResourcePacks({
     setActionLoading("deleteBuild");
     try {
       const { removedFromServer } = await api.resourcePacks.deleteBuild(serverId, build.id);
+      if (selectedBuildId === build.id) {
+        setSelectedBuildId(null);
+        setSelectedBuildDetail(null);
+        setEditingBuildId(null);
+        setEditingBuildName("");
+        setEditingBuildDescription("");
+      }
       await fetchResourcePackData();
       setResourcePackNotice(
         removedFromServer
@@ -499,7 +553,7 @@ export function useResourcePacks({
     } finally {
       setActionLoading(null);
     }
-  }, [fetchProperties, fetchResourcePackData, serverId, setActionError, setActionLoading]);
+  }, [fetchProperties, fetchResourcePackData, selectedBuildId, serverId, setActionError, setActionLoading]);
 
   const handleConfirmResourcePackAction = useCallback(async () => {
     if (!resourcePackConfirm) return;
@@ -585,13 +639,16 @@ export function useResourcePacks({
     try {
       await api.resourcePacks.renameBuild(serverId, build.id, nextName, nextDescription);
       await fetchResourcePackData();
+      if (selectedBuildId === build.id) {
+        await refreshSelectedBuildDetail(build.id);
+      }
       cancelEditingBuild();
     } catch (err: any) {
       setActionError(err.message || "Failed to rename merged build");
     } finally {
       setActionLoading(null);
     }
-  }, [cancelEditingBuild, editingBuildDescription, editingBuildName, fetchResourcePackData, serverId, setActionError, setActionLoading]);
+  }, [cancelEditingBuild, editingBuildDescription, editingBuildName, fetchResourcePackData, refreshSelectedBuildDetail, selectedBuildId, serverId, setActionError, setActionLoading]);
 
   const handleAssignBuild = useCallback(async (buildId: string) => {
     if (!serverId) return;
@@ -599,34 +656,48 @@ export function useResourcePacks({
     setActionError("");
     setActionLoading("assignPack");
     try {
-      await api.resourcePacks.assignToServer(buildId, serverId, {});
+      const { build } = await api.resourcePacks.assignToServer(buildId, serverId, {});
       await fetchResourcePackData();
+      if (selectedBuildId === buildId) {
+        await refreshSelectedBuildDetail(buildId);
+      }
+      setResourcePackNotice(`Assigned merged pack "${build.name}" to this server.`);
+      if (serverStatus === "running") {
+        setRestartNotice("Resource pack assignment changed. Restart the server to apply the updated pack settings to the running server.");
+      }
     } catch (err: any) {
       setActionError(err.message || "Failed to assign merged resource pack");
     } finally {
       setActionLoading(null);
     }
-  }, [fetchResourcePackData, serverId, setActionError, setActionLoading]);
+  }, [fetchResourcePackData, refreshSelectedBuildDetail, selectedBuildId, serverId, serverStatus, setActionError, setActionLoading, setRestartNotice]);
 
   const availableResourcePackEntries: Array<readonly [string, AvailableResourcePack]> = [
     ...resourcePacks.map((pack) => [pack.id, { ...pack, kind: "stored" as const }] as const),
     ...pendingResourcePacks.map((pack) => [pack.id, pack] as const),
   ];
   const availableResourcePackById = new Map<string, AvailableResourcePack>(availableResourcePackEntries);
-  const orderedAvailablePacks = packOrderIds
+  const orderedLibraryPacks = packOrderIds
     .map((packId) => availableResourcePackById.get(packId))
     .filter((pack): pack is AvailableResourcePack => Boolean(pack));
-  const orderedPendingResourcePacks = orderedAvailablePacks.filter(
+  const orderedPendingResourcePacks = orderedLibraryPacks.filter(
     (pack): pack is PendingResourcePack => pack.kind === "pending"
   );
-  const orderedResourcePackIds = orderedAvailablePacks.map((pack) => pack.id);
-  const allAvailablePacksSelected = orderedAvailablePacks.length > 0 && selectedPackIds.length === orderedAvailablePacks.length;
+  const selectedBuildPacks: AvailableResourcePack[] = selectedBuildDetail
+    ? selectedBuildDetail.packs.map((pack) => ({ ...pack, kind: "stored" as const }))
+    : [];
+  const orderedAvailablePacks = selectedBuildDetail ? selectedBuildPacks : orderedLibraryPacks;
+  const orderedResourcePackIds = orderedLibraryPacks.map((pack) => pack.id);
+  const allAvailablePacksSelected = !selectedBuildDetail
+    && orderedLibraryPacks.length > 0
+    && selectedPackIds.length === orderedLibraryPacks.length;
 
   const toggleSelectAllPacks = useCallback(() => {
+    if (selectedBuildDetail) return;
     setSelectedPackIds((current) =>
-      current.length === orderedAvailablePacks.length ? [] : orderedAvailablePacks.map((pack) => pack.id)
+      current.length === orderedLibraryPacks.length ? [] : orderedLibraryPacks.map((pack) => pack.id)
     );
-  }, [orderedAvailablePacks]);
+  }, [orderedLibraryPacks, selectedBuildDetail]);
 
   const handleBuildMergedPack = useCallback(async () => {
     if (!serverId || !serverName) return;
@@ -674,7 +745,7 @@ export function useResourcePacks({
         percent: orderedPendingResourcePacks.length > 0 ? 99 : 50,
       });
 
-      const buildPackIds = orderedAvailablePacks.map((pack) =>
+      const buildPackIds = orderedLibraryPacks.map((pack) =>
         pack.kind === "stored" ? pack.id : uploadedPackByPendingId.get(pack.id)!.id
       );
 
@@ -689,7 +760,7 @@ export function useResourcePacks({
       setBuildDescription(build.description || "");
       clearDraftBuildImage();
       setPreviewConflicts(conflicts);
-      setPreviewPackNames(orderedAvailablePacks.map((pack) => pack.name));
+      setPreviewPackNames(orderedLibraryPacks.map((pack) => pack.name));
       setPendingResourcePacks((current) => current.filter((pack) => !orderedPendingResourcePacks.some((pending) => pending.id === pack.id)));
       await fetchResourcePackData();
       await fetchProperties();
@@ -711,7 +782,7 @@ export function useResourcePacks({
     clearDraftBuildImage,
     fetchProperties,
     fetchResourcePackData,
-    orderedAvailablePacks,
+    orderedLibraryPacks,
     orderedPendingResourcePacks,
     orderedResourcePackIds.length,
     revokePendingPackPreview,
@@ -720,6 +791,33 @@ export function useResourcePacks({
     setActionError,
     setActionLoading,
   ]);
+
+  const selectBuild = useCallback(async (buildId: string) => {
+    setActionError("");
+    setSelectedPackIds([]);
+    cancelEditingPack();
+    clearBuildDraft();
+    clearDraftBuildImage();
+    try {
+      await refreshSelectedBuildDetail(buildId);
+      setSelectedBuildId(buildId);
+    } catch (err: any) {
+      setSelectedBuildId(null);
+      setSelectedBuildDetail(null);
+      setActionError(err.message || "Failed to load merged build details");
+    }
+  }, [cancelEditingPack, clearBuildDraft, clearDraftBuildImage, refreshSelectedBuildDetail, setActionError]);
+
+  const clearSelectedBuild = useCallback(() => {
+    setSelectedBuildId(null);
+    setSelectedBuildDetail(null);
+    setSelectedPackIds([]);
+    setPackOrderIds([]);
+    cancelEditingBuild();
+    cancelEditingPack();
+    clearBuildDraft();
+    clearDraftBuildImage();
+  }, [cancelEditingBuild, cancelEditingPack, clearBuildDraft, clearDraftBuildImage]);
 
   useEffect(() => () => {
     pendingPackPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
@@ -741,10 +839,7 @@ export function useResourcePacks({
         ...resourcePacks.map((pack) => pack.id),
         ...pendingResourcePacks.map((pack) => pack.id),
       ];
-      const validCurrent = current.filter((packId) => availablePackIds.includes(packId));
-      const missingIds = availablePackIds.filter((packId) => !validCurrent.includes(packId));
-
-      return [...validCurrent, ...missingIds];
+      return current.filter((packId) => availablePackIds.includes(packId));
     });
   }, [pendingResourcePacks, resourcePacks]);
 
@@ -774,6 +869,8 @@ export function useResourcePacks({
     resourcePackDragActive,
     resourcePackInputRef,
     resourcePackImageInputRef,
+    selectedBuildId,
+    selectedBuildDetail,
     selectedPackIds,
     setSelectedPackIds,
     editingPackId,
@@ -795,6 +892,7 @@ export function useResourcePacks({
     previewPackNames,
     previewConflicts,
     orderedAvailablePacks,
+    orderedLibraryPacks,
     allAvailablePacksSelected,
     fetchResourcePackData,
     handleUploadResourcePack,
@@ -817,6 +915,8 @@ export function useResourcePacks({
     handlePackPointerMove,
     handleDeleteSelectedPacks,
     handleBuildMergedPack,
+    selectBuild,
+    clearSelectedBuild,
     handleAssignBuild,
     handleConfirmResourcePackAction,
     startEditingPack,

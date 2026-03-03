@@ -14,6 +14,7 @@ interface ServerDetailShellSectionProps {
   server: ServerWithStatus;
   connectionAddress: string;
   connectionCopied: boolean;
+  restartNotice: string;
   mobileHeaderOpen: boolean;
   setMobileHeaderOpen: (value: boolean | ((current: boolean) => boolean)) => void;
   handleBackNavigation: () => void;
@@ -34,6 +35,7 @@ export function ServerDetailShellSection({
   server,
   connectionAddress,
   connectionCopied,
+  restartNotice,
   mobileHeaderOpen,
   setMobileHeaderOpen,
   handleBackNavigation,
@@ -49,6 +51,8 @@ export function ServerDetailShellSection({
   activeTab,
   onTabChange,
 }: ServerDetailShellSectionProps) {
+  const showRestartCallout = isRunning && restartNotice.trim().length > 0;
+
   return (
     <>
       <header className="sticky top-0 z-50 border-b border-surface-800/80 bg-surface-950/85 backdrop-blur-2xl">
@@ -119,6 +123,11 @@ export function ServerDetailShellSection({
                     </div>
 
                     <div className="mt-3 grid gap-2">
+                      {showRestartCallout && (
+                        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                          Changes detected. Restart to apply them.
+                        </div>
+                      )}
                       <button
                         type="button"
                         onClick={() => {
@@ -151,10 +160,15 @@ export function ServerDetailShellSection({
                               setMobileHeaderOpen(false);
                             }}
                             disabled={actionLoading !== null}
-                            className="btn-secondary inline-flex min-h-[42px] items-center justify-center gap-2 text-sm"
+                            className={cn(
+                              "inline-flex min-h-[42px] items-center justify-center gap-2 text-sm",
+                              showRestartCallout
+                                ? "btn-restart-alert animate-restart-nudge"
+                                : "btn-secondary"
+                            )}
                           >
                             <RotateCcw size={14} />
-                            Restart
+                            {showRestartCallout ? "Restart Required" : "Restart"}
                           </button>
                           <button
                             onClick={() => {
@@ -193,14 +207,29 @@ export function ServerDetailShellSection({
                 </button>
               ) : (
                 <>
-                  <button
-                    onClick={onRestart}
-                    disabled={actionLoading !== null}
-                    className="hidden btn-secondary min-h-[44px] items-center justify-center gap-2 text-sm sm:inline-flex"
-                  >
-                    <RotateCcw size={14} />
-                    Restart
-                  </button>
+                  <div className="relative hidden sm:flex">
+                    {showRestartCallout && (
+                      <div className="pointer-events-none absolute left-1/2 top-0 z-10 -translate-x-1/2 -translate-y-[calc(100%+0.35rem)]">
+                        <div className="panel-label whitespace-nowrap border-amber-500/35 bg-amber-500/12 text-amber-100 shadow-lg shadow-amber-950/20">
+                          <span className="h-2 w-2 rounded-full bg-amber-300 animate-pulse" />
+                          Restart Needed
+                        </div>
+                      </div>
+                    )}
+                    <button
+                      onClick={onRestart}
+                      disabled={actionLoading !== null}
+                      className={cn(
+                        "min-h-[44px] items-center justify-center gap-2 text-sm sm:inline-flex",
+                        showRestartCallout
+                          ? "btn-restart-alert animate-restart-nudge"
+                          : "btn-secondary"
+                      )}
+                    >
+                      <RotateCcw size={14} />
+                      {showRestartCallout ? "Apply Changes With Restart" : "Restart"}
+                    </button>
+                  </div>
                   <button
                     onClick={onStop}
                     disabled={actionLoading !== null}

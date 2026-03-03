@@ -18,6 +18,7 @@ type UseServerPropertiesOptions = {
   serverCreatedAt?: string;
   setActionError: Dispatch<SetStateAction<string>>;
   setActionLoading: Dispatch<SetStateAction<string | null>>;
+  setRestartNotice: Dispatch<SetStateAction<string>>;
 };
 
 const PROPERTY_BOOTSTRAP_WINDOW_MS = 2 * 60 * 1000;
@@ -42,6 +43,7 @@ export function useServerProperties({
   serverCreatedAt,
   setActionError,
   setActionLoading,
+  setRestartNotice,
 }: UseServerPropertiesOptions) {
   const [properties, setProperties] = useState<Record<string, string>>({});
   const [serverPropertiesExists, setServerPropertiesExists] = useState(true);
@@ -235,13 +237,16 @@ export function useServerProperties({
       propertiesBaselineRef.current = propertiesRef.current;
       setPropertiesSaved(true);
       setTimeout(() => setPropertiesSaved(false), 2000);
+      if (serverStatus === "running") {
+        setRestartNotice("Server changes were saved. Restart the server to apply updated properties or files before players see the new result.");
+      }
     } catch (err: any) {
       setActionError(err.message || (pendingServerIconFile ? "Failed to save properties or upload server icon" : "Failed to save properties"));
     } finally {
       setServerIconUploadProgress(null);
       setActionLoading(null);
     }
-  }, [id, pendingServerIconFile, setActionError, setActionLoading, uploadPendingServerIcon]);
+  }, [id, pendingServerIconFile, serverStatus, setActionError, setActionLoading, setRestartNotice, uploadPendingServerIcon]);
 
   const handleCreatePropertiesFile = useCallback(async () => {
     if (!id) return;
@@ -256,12 +261,15 @@ export function useServerProperties({
       syncPropertyFormatDrafts(created.properties);
       setPropertiesSaved(true);
       setTimeout(() => setPropertiesSaved(false), 2000);
+      if (serverStatus === "running") {
+        setRestartNotice("A new server.properties file was created. Restart the server to apply it.");
+      }
     } catch (err: any) {
       setActionError(err.message || "Failed to create server.properties");
     } finally {
       setActionLoading(null);
     }
-  }, [id, setActionError, setActionLoading, syncPropertyFormatDrafts]);
+  }, [id, serverStatus, setActionError, setActionLoading, setRestartNotice, syncPropertyFormatDrafts]);
 
   const applyPreparedServerIcon = useCallback((iconFile: File) => {
     const previewUrl = URL.createObjectURL(iconFile);
