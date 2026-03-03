@@ -59,6 +59,7 @@ export function useServerProperties({
   const [propertyPreviewAnimationFrame, setPropertyPreviewAnimationFrame] = useState(0);
   const [serverIconDragActive, setServerIconDragActive] = useState(false);
   const [serverIconCacheBust, setServerIconCacheBust] = useState(0);
+  const [serverIconExists, setServerIconExists] = useState(false);
   const [pendingServerIconFile, setPendingServerIconFile] = useState<File | null>(null);
   const [pendingServerIconPreviewUrl, setPendingServerIconPreviewUrl] = useState<string | null>(null);
   const [serverIconUploadProgress, setServerIconUploadProgress] = useState<number | null>(null);
@@ -94,6 +95,7 @@ export function useServerProperties({
 
   const refreshServerIconPreview = useCallback(() => {
     setServerIconCacheBust(Date.now());
+    setServerIconExists(true);
   }, []);
 
   const fetchProperties = useCallback(async () => {
@@ -131,6 +133,20 @@ export function useServerProperties({
       setPropertiesLoaded(true);
     }
   }, [id, serverCreatedAt, serverStatus, syncPropertyFormatDrafts]);
+
+  const fetchServerIconState = useCallback(async () => {
+    if (!id) {
+      setServerIconExists(false);
+      return;
+    }
+
+    try {
+      const { files } = await api.files.list(id);
+      setServerIconExists(files.some((file) => !file.isDirectory && file.path === "server-icon.png"));
+    } catch {
+      setServerIconExists(false);
+    }
+  }, [id]);
 
   const setPropertyValue = useCallback((key: string, value: string) => {
     setProperties((current) => {
@@ -247,6 +263,20 @@ export function useServerProperties({
     }
   }, [id, setActionError, setActionLoading, syncPropertyFormatDrafts]);
 
+  const applyPreparedServerIcon = useCallback((iconFile: File) => {
+    const previewUrl = URL.createObjectURL(iconFile);
+
+    if (serverIconPreviewUrlRef.current) {
+      URL.revokeObjectURL(serverIconPreviewUrlRef.current);
+    }
+
+    serverIconPreviewUrlRef.current = previewUrl;
+    setPendingServerIconFile(iconFile);
+    setPendingServerIconPreviewUrl(previewUrl);
+    setServerIconExists(true);
+    setServerIconUploadProgress(null);
+  }, []);
+
   const handleServerIconUpload = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -261,20 +291,11 @@ export function useServerProperties({
     setActionError("");
     try {
       const iconFile = await resizeServerIcon(file);
-      const previewUrl = URL.createObjectURL(iconFile);
-
-      if (serverIconPreviewUrlRef.current) {
-        URL.revokeObjectURL(serverIconPreviewUrlRef.current);
-      }
-
-      serverIconPreviewUrlRef.current = previewUrl;
-      setPendingServerIconFile(iconFile);
-      setPendingServerIconPreviewUrl(previewUrl);
-      setServerIconUploadProgress(null);
+      applyPreparedServerIcon(iconFile);
     } catch (err: any) {
       setActionError(err.message || "Failed to prepare server icon");
     }
-  }, [setActionError]);
+  }, [applyPreparedServerIcon, setActionError]);
 
   const handleServerIconDrop = useCallback(async (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
@@ -307,7 +328,9 @@ export function useServerProperties({
     JSON.stringify(normalizePropertiesForComparison(properties)) !==
     JSON.stringify(normalizePropertiesForComparison(propertiesBaselineRef.current));
   const canUndoPropertyChange = hasUnsavedProperties || hasPendingServerIcon;
-  const serverIconUrl = pendingServerIconPreviewUrl || (id ? `${api.files.downloadUrl(id, "server-icon.png")}&v=${serverIconCacheBust}` : "");
+  const serverIconUrl =
+    pendingServerIconPreviewUrl ||
+    (serverIconExists && id ? `${api.files.downloadUrl(id, "server-icon.png")}&v=${serverIconCacheBust}` : "");
 
   useEffect(() => {
     propertiesRef.current = properties;
@@ -364,11 +387,13 @@ export function useServerProperties({
     if (serverStatus !== "running") {
       setPropertiesInitializing(false);
       setPropertiesLoaded(true);
+      setServerIconExists(false);
       return;
     }
 
     void fetchProperties();
-  }, [activeTab, fetchProperties, serverStatus]);
+    void fetchServerIconState();
+  }, [activeTab, fetchProperties, fetchServerIconState, serverStatus]);
 
   useEffect(() => {
     if (
@@ -437,6 +462,7 @@ export function useServerProperties({
     fetchProperties,
     handleSaveProperties,
     handleCreatePropertiesFile,
+    applyPreparedServerIcon,
     setPropertyValue,
     setCustomizablePropertyValue,
     syncCustomizablePropertyDraftFromRaw,
@@ -452,6 +478,7 @@ export function useServerProperties({
     hasUnsavedProperties,
     canUndoPropertyChange,
     serverIconUrl,
+    serverIconExists,
     refreshServerIconPreview,
   };
 }

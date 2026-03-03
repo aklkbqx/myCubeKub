@@ -24,6 +24,7 @@ interface MergeSourcePack {
 interface MergeBuildOptions {
   buildId: string;
   name: string;
+  description?: string | null;
   packs: MergeSourcePack[];
   image?: File | null;
 }
@@ -42,6 +43,7 @@ interface MergeBuildResult {
 
 interface ResourcePackManifest {
   name: string;
+  description?: string | null;
   generatedFilename: string;
   publicPath: string;
   sha1: string;
@@ -49,6 +51,11 @@ interface ResourcePackManifest {
   packs: Array<{ id: string; name: string }>;
   conflictPaths: string[];
 }
+
+type BuildMetadataUpdate = {
+  name: string;
+  description?: string | null;
+};
 
 const BUILD_IMAGE_EXTENSION_BY_MIME_TYPE: Record<string, string> = {
   "image/png": ".png",
@@ -68,6 +75,15 @@ async function ensureDirectories() {
     mkdir(BUILDS_WORK_DIR, { recursive: true }),
     mkdir(PUBLIC_PACKS_DIR, { recursive: true }),
   ]);
+}
+
+async function listManagedFiles(directory: string) {
+  try {
+    const entries = await readdir(directory, { withFileTypes: true });
+    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
+  } catch {
+    return [];
+  }
 }
 
 async function hashFile(filePath: string) {
@@ -200,6 +216,44 @@ async function syncPackImageFromDirectory(sourceDir: string, imageFilename: stri
     imageFilename,
     imagePublicPath: `/public/resource-packs/${imageFilename}`,
   };
+}
+
+function toMinecraftPackDescription(name: string, description?: string | null) {
+  const trimmedName = name.trim();
+  const trimmedDescription = description?.trim() || "";
+
+  if (!trimmedDescription) {
+    return trimmedName;
+  }
+
+  return `${trimmedName}\n${trimmedDescription}`;
+}
+
+async function writeBuildPackMetadataToDirectory(
+  targetDir: string,
+  metadata: BuildMetadataUpdate
+) {
+  const mcmetaPath = join(targetDir, "pack.mcmeta");
+  const rawContent = await readFile(mcmetaPath, "utf-8");
+
+  let parsedContent: Record<string, any>;
+  try {
+    parsedContent = JSON.parse(rawContent);
+  } catch {
+    throw new Error("Merged output contains an invalid pack.mcmeta file.");
+  }
+
+  const currentPackSection =
+    parsedContent.pack && typeof parsedContent.pack === "object" && !Array.isArray(parsedContent.pack)
+      ? parsedContent.pack
+      : {};
+
+  parsedContent.pack = {
+    ...currentPackSection,
+    description: toMinecraftPackDescription(metadata.name, metadata.description),
+  };
+
+  await writeFile(mcmetaPath, `${JSON.stringify(parsedContent, null, 2)}\n`, "utf-8");
 }
 
 async function writeBuildImageToDirectory(targetDir: string, image: File) {
@@ -341,6 +395,11 @@ export async function buildMergedResourcePack(options: MergeBuildOptions): Promi
       throw new Error("Merged output is missing pack.mcmeta. Check uploaded resource packs.");
     }
 
+    await writeBuildPackMetadataToDirectory(mergedRoot, {
+      name: options.name,
+      description: options.description,
+    });
+
     if (options.image) {
       await writeBuildImageToDirectory(mergedRoot, options.image);
     }
@@ -356,6 +415,7 @@ export async function buildMergedResourcePack(options: MergeBuildOptions): Promi
     const manifestPath = join(PUBLIC_PACKS_DIR, `${generatedFilename}.json`);
     const manifest: ResourcePackManifest = {
       name: options.name,
+      description: options.description ?? null,
       generatedFilename,
       publicPath,
       sha1,
@@ -439,6 +499,63 @@ export async function replaceBuildPackImage(buildArchivePath: string, image: Fil
   }
 }
 
+async function updateResourcePackManifestMetadata(generatedFilename: string, metadata: BuildMetadataUpdate) {
+  const manifestPath = join(PUBLIC_PACKS_DIR, `${generatedFilename}.json`);
+
+  if (!existsSync(manifestPath)) {
+    return;
+  }
+
+  try {
+    const rawContent = await readFile(manifestPath, "utf-8");
+    const manifest = JSON.parse(rawContent) as ResourcePackManifest;
+
+    manifest.name = metadata.name;
+    manifest.description = metadata.description?.trim() || null;
+
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+  } catch {
+    return;
+  }
+}
+
+export async function updateBuiltResourcePackMetadata(
+  buildArchivePath: string,
+  generatedFilename: string,
+  metadata: BuildMetadataUpdate
+) {
+  await ensureDirectories();
+
+  const workId = randomUUID();
+  const workDir = join(BUILDS_WORK_DIR, `build-meta-${workId}`);
+  const mergedRoot = join(workDir, "merged");
+
+  await rm(workDir, { recursive: true, force: true });
+  await mkdir(mergedRoot, { recursive: true });
+
+  try {
+    await unzipToDirectory(buildArchivePath, mergedRoot);
+
+    if (!existsSync(join(mergedRoot, "pack.mcmeta"))) {
+      throw new Error("Merged resource pack is missing pack.mcmeta.");
+    }
+
+    await writeBuildPackMetadataToDirectory(mergedRoot, metadata);
+    await zipDirectory(mergedRoot, buildArchivePath);
+    await updateResourcePackManifestMetadata(generatedFilename, metadata);
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+
+  const fileStats = await stat(buildArchivePath);
+  const sha1 = await hashFile(buildArchivePath);
+
+  return {
+    sha1,
+    sizeBytes: fileStats.size,
+  };
+}
+
 export async function updateBuiltResourcePackImage(buildId: string, buildArchivePath: string, image: File) {
   await replaceBuildPackImage(buildArchivePath, image);
   const imageMeta = await saveBuildResourcePackImage(buildId, image);
@@ -460,6 +577,71 @@ export async function deleteMergedResourcePackFiles(generatedFilename: string) {
     rm(archivePath, { force: true }),
     rm(manifestPath, { force: true }),
   ]);
+}
+
+export async function cleanupOrphanedResourcePackFiles() {
+  await ensureDirectories();
+
+  const [packs, builds, sourceFiles, publicFiles] = await Promise.all([
+    db.select({
+      storedFilename: schema.resourcePacks.storedFilename,
+      imageFilename: schema.resourcePacks.imageFilename,
+    }).from(schema.resourcePacks),
+    db.select({
+      generatedFilename: schema.resourcePackBuilds.generatedFilename,
+      imageFilename: schema.resourcePackBuilds.imageFilename,
+    }).from(schema.resourcePackBuilds),
+    listManagedFiles(SOURCE_PACKS_DIR),
+    listManagedFiles(PUBLIC_PACKS_DIR),
+  ]);
+
+  const expectedSourceFiles = new Set(
+    packs
+      .map((pack) => pack.storedFilename)
+      .filter((filename): filename is string => Boolean(filename))
+  );
+
+  const expectedPublicFiles = new Set<string>();
+
+  for (const pack of packs) {
+    if (pack.imageFilename) {
+      expectedPublicFiles.add(pack.imageFilename);
+    }
+  }
+
+  for (const build of builds) {
+    expectedPublicFiles.add(build.generatedFilename);
+    expectedPublicFiles.add(`${build.generatedFilename}.json`);
+    if (build.imageFilename) {
+      expectedPublicFiles.add(build.imageFilename);
+    }
+  }
+
+  let removedSourceFiles = 0;
+  let removedPublicFiles = 0;
+
+  for (const filename of sourceFiles) {
+    if (expectedSourceFiles.has(filename)) {
+      continue;
+    }
+
+    await rm(join(SOURCE_PACKS_DIR, filename), { force: true });
+    removedSourceFiles += 1;
+  }
+
+  for (const filename of publicFiles) {
+    if (expectedPublicFiles.has(filename)) {
+      continue;
+    }
+
+    await rm(join(PUBLIC_PACKS_DIR, filename), { force: true });
+    removedPublicFiles += 1;
+  }
+
+  return {
+    removedSourceFiles,
+    removedPublicFiles,
+  };
 }
 
 export async function deleteResourcePackDataForServer(serverId: string) {
@@ -487,9 +669,12 @@ export async function deleteResourcePackDataForServer(serverId: string) {
   await db.delete(schema.resourcePackBuilds).where(eq(schema.resourcePackBuilds.serverId, serverId));
   await db.delete(schema.resourcePacks).where(eq(schema.resourcePacks.serverId, serverId));
 
+  const cleanup = await cleanupOrphanedResourcePackFiles();
+
   return {
     packCount: packs.length,
     buildCount: builds.length,
+    ...cleanup,
   };
 }
 
@@ -499,4 +684,17 @@ export function getPublicResourcePackPath(filename: string) {
 
 export function getPublicResourcePackUrl(publicPath: string) {
   return `${PUBLIC_FILE_BASE_URL}${publicPath}`;
+}
+
+export function getBrowserResourcePackUrl(publicPath: string) {
+  return publicPath;
+}
+
+export function hasPublicResourcePackFile(publicPathOrFilename?: string | null) {
+  if (!publicPathOrFilename) {
+    return false;
+  }
+
+  const filename = basename(publicPathOrFilename);
+  return existsSync(getPublicResourcePackPath(filename));
 }

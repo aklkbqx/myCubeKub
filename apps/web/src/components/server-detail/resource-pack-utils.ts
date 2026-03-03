@@ -1,6 +1,16 @@
 const RESOURCE_PACK_IMAGE_SIZE = 512;
 const SERVER_ICON_SIZE = 64;
 
+export type ImageResizeMode = "cover" | "contain";
+export type ImageEditOptions = {
+  mode: ImageResizeMode;
+  zoom?: number;
+  offsetX?: number;
+  offsetY?: number;
+  flipX?: boolean;
+  flipY?: boolean;
+};
+
 const ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
 const ZIP_CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50;
 const ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x06054b50;
@@ -28,7 +38,7 @@ async function resizeSquarePng(
   readErrorMessage: string,
   loadErrorMessage: string,
   encodeErrorMessage: string,
-  mode: "cover" | "stretch"
+  modeOrOptions: ImageResizeMode | ImageEditOptions | "stretch"
 ) {
   const image = await loadImageFromFile(file, readErrorMessage, loadErrorMessage);
   const canvas = document.createElement("canvas");
@@ -44,15 +54,35 @@ async function resizeSquarePng(
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = "high";
 
-  if (mode === "cover") {
-    const scale = Math.max(size / image.width, size / image.height);
+  if (modeOrOptions === "stretch") {
+    context.drawImage(image, 0, 0, size, size);
+  } else {
+    const options = typeof modeOrOptions === "string"
+      ? { mode: modeOrOptions }
+      : modeOrOptions;
+    const mode = options.mode;
+    const zoomValue = typeof options.zoom === "number" && Number.isFinite(options.zoom) ? options.zoom : 1;
+    const offsetXValue = typeof options.offsetX === "number" && Number.isFinite(options.offsetX) ? options.offsetX : 0;
+    const offsetYValue = typeof options.offsetY === "number" && Number.isFinite(options.offsetY) ? options.offsetY : 0;
+    const zoom = Math.max(1, zoomValue);
+    const requestedOffsetX = offsetXValue * size;
+    const requestedOffsetY = offsetYValue * size;
+    const baseScale = mode === "cover"
+      ? Math.max(size / image.width, size / image.height)
+      : Math.min(size / image.width, size / image.height);
+    const scale = baseScale * zoom;
     const drawWidth = image.width * scale;
     const drawHeight = image.height * scale;
-    const offsetX = (size - drawWidth) / 2;
-    const offsetY = (size - drawHeight) / 2;
-    context.drawImage(image, offsetX, offsetY, drawWidth, drawHeight);
-  } else {
-    context.drawImage(image, 0, 0, size, size);
+    const offsetLimitX = Math.abs(drawWidth - size) / 2;
+    const offsetLimitY = Math.abs(drawHeight - size) / 2;
+    const offsetX = Math.max(-offsetLimitX, Math.min(offsetLimitX, requestedOffsetX));
+    const offsetY = Math.max(-offsetLimitY, Math.min(offsetLimitY, requestedOffsetY));
+
+    context.save();
+    context.translate(size / 2 + offsetX, size / 2 + offsetY);
+    context.scale(options.flipX ? -scale : scale, options.flipY ? -scale : scale);
+    context.drawImage(image, -image.width / 2, -image.height / 2);
+    context.restore();
   }
 
   const blob = await new Promise<Blob>((resolve, reject) => {
@@ -92,7 +122,15 @@ async function inflateZipEntry(data: Uint8Array) {
   return new Uint8Array(arrayBuffer);
 }
 
-export async function resizeResourcePackImage(file: File) {
+export const IMAGE_EDIT_SIZES = {
+  resourcePack: RESOURCE_PACK_IMAGE_SIZE,
+  serverIcon: SERVER_ICON_SIZE,
+} as const;
+
+export async function resizeResourcePackImage(
+  file: File,
+  options: ImageResizeMode | ImageEditOptions = "cover"
+) {
   if (!file.type.startsWith("image/")) {
     throw new Error("Only image files are supported for resource pack cover");
   }
@@ -105,11 +143,14 @@ export async function resizeResourcePackImage(file: File) {
     "Failed to read image file",
     "Failed to read image file",
     "Failed to resize image",
-    "cover"
+    options
   );
 }
 
-export async function resizeServerIcon(file: File) {
+export async function resizeServerIcon(
+  file: File,
+  options: ImageResizeMode | ImageEditOptions = "contain"
+) {
   return resizeSquarePng(
     file,
     SERVER_ICON_SIZE,
@@ -117,7 +158,7 @@ export async function resizeServerIcon(file: File) {
     "Failed to read server icon",
     "Failed to load server icon",
     "Failed to encode resized server icon",
-    "stretch"
+    options
   );
 }
 

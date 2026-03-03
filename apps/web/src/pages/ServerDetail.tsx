@@ -1,10 +1,11 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, type ChangeEvent, type DragEvent } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { ConsoleTabSection } from "@/components/server-detail/ConsoleTabSection";
 import { BackupConfirmModal } from "@/components/server-detail/BackupConfirmModal";
 import { DangerConfirmModal } from "@/components/server-detail/DangerConfirmModal";
 import { FilesTabSection } from "@/components/server-detail/FilesTabSection";
+import { ImageEditModal } from "@/components/server-detail/ImageEditModal";
 import { PropertyCustomizerModal } from "@/components/server-detail/PropertyCustomizerModal";
 import { ResourcePackConfirmModal } from "@/components/server-detail/ResourcePackConfirmModal";
 import { ResourcePacksTabSection } from "@/components/server-detail/ResourcePacksTabSection";
@@ -28,6 +29,13 @@ import {
     PROPERTY_FIELDS,
     renderMinecraftPreviewSegments,
 } from "@/components/server-detail/properties-config";
+import {
+    IMAGE_EDIT_SIZES,
+    resizeResourcePackImage,
+    resizeServerIcon,
+    type ImageEditOptions,
+    type ImageResizeMode,
+} from "@/components/server-detail/resource-pack-utils";
 import {
     type DangerConfirmState,
     type ServerDetailTab,
@@ -57,6 +65,16 @@ export function ServerDetail() {
     const [actionError, setActionError] = useState("");
     const [connectionCopied, setConnectionCopied] = useState(false);
     const [mobileHeaderOpen, setMobileHeaderOpen] = useState(false);
+    const [imageEditState, setImageEditState] = useState<{
+        file: File;
+        target: "serverIcon" | "buildImage";
+        buildTargetId?: string;
+        title: string;
+        confirmLabel: string;
+        size: number;
+        initialMode: ImageResizeMode;
+    } | null>(null);
+    const [imageEditApplying, setImageEditApplying] = useState(false);
 
     // Delete confirmation
     const [deleteConfirmText, setDeleteConfirmText] = useState("");
@@ -87,6 +105,7 @@ export function ServerDetail() {
         fetchProperties,
         handleSaveProperties,
         handleCreatePropertiesFile,
+        applyPreparedServerIcon,
         setPropertyValue,
         setCustomizablePropertyValue,
         syncCustomizablePropertyDraftFromRaw,
@@ -94,14 +113,13 @@ export function ServerDetail() {
         clearCustomizablePropertyFormatting,
         clearPendingServerIcon,
         handleUndoPropertyChange,
-        handleServerIconUpload,
-        handleServerIconDrop,
         uploadPendingServerIcon,
         discardLocalPropertyChanges,
         hasPendingServerIcon,
         hasUnsavedProperties,
         canUndoPropertyChange,
         serverIconUrl,
+        serverIconExists,
         refreshServerIconPreview,
     } = useServerProperties({
         id,
@@ -180,10 +198,14 @@ export function ServerDetail() {
         editingBuildId,
         editingBuildName,
         setEditingBuildName,
+        editingBuildDescription,
+        setEditingBuildDescription,
         draggedPackId,
         dragOverPackId,
         buildName,
         setBuildName,
+        buildDescription,
+        setBuildDescription,
         buildImagePreviewUrl,
         buildImageFile,
         previewPackNames,
@@ -197,7 +219,8 @@ export function ServerDetail() {
         handleResourcePackDragOver,
         handleResourcePackDragLeave,
         handleResourcePackDrop,
-        handleBuildImageSelected,
+        applyPreparedBuildImage,
+        consumeBuildImageSelectionTarget,
         openBuildImagePicker,
         openDraftBuildImagePicker,
         clearDraftBuildImage,
@@ -206,6 +229,7 @@ export function ServerDetail() {
         movePackInLibrary,
         handlePackPointerDown,
         handlePackPointerEnter,
+        handlePackPointerMove,
         handleDeleteSelectedPacks,
         handleBuildMergedPack,
         handleAssignBuild,
@@ -226,7 +250,7 @@ export function ServerDetail() {
     });
 
     useEffect(() => {
-        if (!actionLoading) {
+        if (!actionLoading && !imageEditState) {
             return;
         }
 
@@ -239,7 +263,98 @@ export function ServerDetail() {
             document.body.style.overflow = previousBodyOverflow;
             document.documentElement.style.overflow = previousHtmlOverflow;
         };
-    }, [actionLoading]);
+    }, [actionLoading, imageEditState]);
+
+    const openImageEditor = useCallback((nextState: NonNullable<typeof imageEditState>) => {
+        setActionError("");
+        setImageEditState(nextState);
+    }, []);
+
+    const handleServerIconInputForEditor = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        event.target.value = "";
+        if (!file) return;
+
+        if (file.type !== "image/png") {
+            setActionError("Server icon must be a PNG image.");
+            return;
+        }
+
+        openImageEditor({
+            file,
+            target: "serverIcon",
+            title: "Edit Server Icon",
+            confirmLabel: "Use Server Icon",
+            size: IMAGE_EDIT_SIZES.serverIcon,
+            initialMode: "contain",
+        });
+    }, [openImageEditor]);
+
+    const handleServerIconDropForEditor = useCallback((event: DragEvent<HTMLLabelElement>) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setServerIconDragActive(false);
+
+        const file = event.dataTransfer.files?.[0];
+        if (!file) return;
+
+        if (file.type !== "image/png") {
+            setActionError("Server icon must be a PNG image.");
+            return;
+        }
+
+        openImageEditor({
+            file,
+            target: "serverIcon",
+            title: "Edit Server Icon",
+            confirmLabel: "Use Server Icon",
+            size: IMAGE_EDIT_SIZES.serverIcon,
+            initialMode: "contain",
+        });
+    }, [openImageEditor, setServerIconDragActive]);
+
+    const handleBuildImageInputForEditor = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        event.target.value = "";
+        const targetBuildId = consumeBuildImageSelectionTarget();
+
+        if (!file || !targetBuildId) {
+            return;
+        }
+
+        openImageEditor({
+            file,
+            target: "buildImage",
+            buildTargetId: targetBuildId,
+            title: targetBuildId === "__draft__" ? "Edit Build Image" : "Edit Merged Pack Image",
+            confirmLabel: targetBuildId === "__draft__" ? "Use Build Image" : "Update Build Image",
+            size: IMAGE_EDIT_SIZES.resourcePack,
+            initialMode: "cover",
+        });
+    }, [consumeBuildImageSelectionTarget, openImageEditor]);
+
+    const handleConfirmImageEdit = useCallback(async (options: ImageEditOptions) => {
+        if (!imageEditState) return;
+
+        setImageEditApplying(true);
+        setActionError("");
+
+        try {
+            if (imageEditState.target === "serverIcon") {
+                const resizedFile = await resizeServerIcon(imageEditState.file, options);
+                applyPreparedServerIcon(resizedFile);
+            } else if (imageEditState.buildTargetId) {
+                const resizedFile = await resizeResourcePackImage(imageEditState.file, options);
+                await applyPreparedBuildImage(resizedFile, imageEditState.buildTargetId);
+            }
+
+            setImageEditState(null);
+        } catch (err: any) {
+            setActionError(err.message || "Failed to prepare image");
+        } finally {
+            setImageEditApplying(false);
+        }
+    }, [applyPreparedBuildImage, applyPreparedServerIcon, imageEditState]);
 
     const handleAction = async (action: string, fn: () => Promise<any>) => {
         setActionError("");
@@ -420,11 +535,12 @@ export function ServerDetail() {
                         hasPendingServerIcon={hasPendingServerIcon}
                         propertiesSaved={propertiesSaved}
                         serverPropertiesExists={serverPropertiesExists}
+                        serverIconExists={serverIconExists}
                         serverIconUrl={serverIconUrl}
                         serverIconDragActive={serverIconDragActive}
                         onServerIconDragActiveChange={(isActive) => setServerIconDragActive(isActive)}
-                        onServerIconDrop={handleServerIconDrop}
-                        onServerIconUpload={handleServerIconUpload}
+                        onServerIconDrop={handleServerIconDropForEditor}
+                        onServerIconUpload={handleServerIconInputForEditor}
                         pendingServerIconFile={pendingServerIconFile}
                         serverIconUploadProgress={serverIconUploadProgress}
                         propertyFields={PROPERTY_FIELDS}
@@ -454,7 +570,7 @@ export function ServerDetail() {
                         resourcePackInputRef={resourcePackInputRef}
                         handleUploadResourcePack={handleUploadResourcePack}
                         resourcePackImageInputRef={resourcePackImageInputRef}
-                        handleBuildImageSelected={handleBuildImageSelected}
+                        handleBuildImageSelected={handleBuildImageInputForEditor}
                         resourcePackNotice={resourcePackNotice}
                         resourcePackProgress={resourcePackProgress}
                         orderedAvailablePacks={orderedAvailablePacks}
@@ -470,6 +586,7 @@ export function ServerDetail() {
                         dragOverPackId={dragOverPackId}
                         handlePackPointerDown={handlePackPointerDown}
                         handlePackPointerEnter={handlePackPointerEnter}
+                        handlePackPointerMove={handlePackPointerMove}
                         togglePackSelection={togglePackSelection}
                         handleRenamePack={handleRenamePack}
                         startEditingPack={startEditingPack}
@@ -478,6 +595,8 @@ export function ServerDetail() {
                         movePackInLibrary={movePackInLibrary}
                         buildName={buildName}
                         setBuildName={(value) => setBuildName(value)}
+                        buildDescription={buildDescription}
+                        setBuildDescription={(value) => setBuildDescription(value)}
                         serverName={server.name}
                         buildImagePreviewUrl={buildImagePreviewUrl}
                         buildImageFile={buildImageFile}
@@ -490,6 +609,8 @@ export function ServerDetail() {
                         editingBuildId={editingBuildId}
                         editingBuildName={editingBuildName}
                         setEditingBuildName={(value) => setEditingBuildName(value)}
+                        editingBuildDescription={editingBuildDescription}
+                        setEditingBuildDescription={(value) => setEditingBuildDescription(value)}
                         handleRenameBuild={handleRenameBuild}
                         startEditingBuild={startEditingBuild}
                         cancelEditingBuild={cancelEditingBuild}
@@ -522,6 +643,22 @@ export function ServerDetail() {
                         confirmState={resourcePackConfirm}
                         onCancel={() => setResourcePackConfirm(null)}
                         onConfirm={handleConfirmResourcePackAction}
+                    />
+                )}
+
+                {imageEditState && (
+                    <ImageEditModal
+                        file={imageEditState.file}
+                        title={imageEditState.title}
+                        size={imageEditState.size}
+                        confirmLabel={imageEditState.confirmLabel}
+                        initialMode={imageEditState.initialMode}
+                        saving={imageEditApplying}
+                        onCancel={() => {
+                            if (imageEditApplying) return;
+                            setImageEditState(null);
+                        }}
+                        onConfirm={handleConfirmImageEdit}
                     />
                 )}
 

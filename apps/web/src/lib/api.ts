@@ -346,11 +346,15 @@ class ApiClient {
       serverId: string,
       name: string,
       packIds: string[],
+      description?: string,
       image?: File
     ): Promise<{ build: ResourcePackBuildInfo; conflicts: string[] }> => {
       const formData = new FormData();
       formData.append("serverId", serverId);
       formData.append("name", name);
+      if (description?.trim()) {
+        formData.append("description", description.trim());
+      }
       packIds.forEach((packId) => formData.append("packIds", packId));
       if (image) {
         formData.append("image", image);
@@ -394,16 +398,16 @@ class ApiClient {
         }),
       }),
 
-    deleteBuild: (serverId: string, buildId: string): Promise<{ success: boolean }> =>
-      this.requestJson<{ success: boolean }>(`${API_BASE}/resource-packs/builds/${buildId}?serverId=${encodeURIComponent(serverId)}`, {
+    deleteBuild: (serverId: string, buildId: string): Promise<{ success: boolean; removedFromServer: boolean }> =>
+      this.requestJson<{ success: boolean; removedFromServer: boolean }>(`${API_BASE}/resource-packs/builds/${buildId}?serverId=${encodeURIComponent(serverId)}`, {
         method: "DELETE",
       }),
 
-    renameBuild: (serverId: string, buildId: string, name: string): Promise<{ build: ResourcePackBuildInfo }> =>
+    renameBuild: (serverId: string, buildId: string, name: string, description?: string): Promise<{ build: ResourcePackBuildInfo }> =>
       this.requestJson<{ build: ResourcePackBuildInfo }>(`${API_BASE}/resource-packs/builds/${buildId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ serverId, name }),
+        body: JSON.stringify({ serverId, name, description }),
       }),
   };
 }

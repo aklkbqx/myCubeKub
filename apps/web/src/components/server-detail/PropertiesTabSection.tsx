@@ -18,6 +18,7 @@ interface PropertiesTabSectionProps {
   hasPendingServerIcon: boolean;
   propertiesSaved: boolean;
   serverPropertiesExists: boolean;
+  serverIconExists: boolean;
   serverIconUrl: string;
   serverIconDragActive: boolean;
   onServerIconDragActiveChange: (isActive: boolean) => void;
@@ -52,6 +53,7 @@ export function PropertiesTabSection({
   hasPendingServerIcon,
   propertiesSaved,
   serverPropertiesExists,
+  serverIconExists,
   serverIconUrl,
   serverIconDragActive,
   onServerIconDragActiveChange,
@@ -179,24 +181,18 @@ export function PropertiesTabSection({
             <div className="mt-4 grid gap-4 lg:grid-cols-[180px_minmax(0,1fr)]">
               <div className="flex items-center justify-center">
                 <div className="flex h-32 w-32 items-center justify-center overflow-hidden rounded-2xl border border-surface-700/70 bg-surface-950/70 shadow-inner shadow-black/20">
-                  <img
-                    src={serverIconUrl}
-                    alt="Server icon preview"
-                    className="h-full w-full object-cover"
-                    onError={(event) => {
-                      event.currentTarget.style.display = "none";
-                      event.currentTarget.nextElementSibling?.classList.remove("hidden");
-                    }}
-                    onLoad={(event) => {
-                      event.currentTarget.style.display = "block";
-                      event.currentTarget.nextElementSibling?.classList.add("hidden");
-                    }}
-                  />
-                  <div className="hidden flex-col items-center gap-2 text-surface-500">
+                  {serverIconUrl ? (
+                    <img
+                      src={serverIconUrl}
+                      alt="Server icon preview"
+                      className="h-full w-full object-cover"
+                    />
+                  ) : null}
+                  <div className={cn("flex-col items-center gap-2 text-surface-500", serverIconUrl ? "hidden" : "flex")}>
                     <div className="flex justify-center">
                       <ImageIcon size={24} />
                     </div>
-                    <span className="text-xs">No icon yet</span>
+                    <span className="text-xs">{serverIconExists ? "Loading icon..." : "No icon yet"}</span>
                   </div>
                 </div>
               </div>

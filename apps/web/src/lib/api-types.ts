@@ -80,9 +80,11 @@ export interface ResourcePackInfo {
 export interface ResourcePackBuildInfo {
   id: string;
   name: string;
+  description: string | null;
   generatedFilename: string;
   publicPath: string;
   publicUrl: string;
+  assignedToServer: boolean;
   imageFilename: string | null;
   imagePublicPath: string | null;
   imageUrl: string | null;

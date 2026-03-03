@@ -64,6 +64,7 @@ export const resourcePackBuilds = pgTable("resource_pack_builds", {
   id: uuid("id").defaultRandom().primaryKey(),
   serverId: uuid("server_id").references(() => servers.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
+  description: text("description"),
   generatedFilename: text("generated_filename").notNull(),
   filePath: text("file_path").notNull(),
   publicPath: text("public_path").notNull(),

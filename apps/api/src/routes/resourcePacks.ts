@@ -8,14 +8,18 @@ import { cacheKeys } from "../services/cacheKeys";
 import * as composeService from "../services/compose";
 import {
   buildMergedResourcePack,
+  cleanupOrphanedResourcePackFiles,
   deleteMergedResourcePackFiles,
   deleteResourcePackImage,
   deleteStoredResourcePackByFilename,
+  getBrowserResourcePackUrl,
+  hasPublicResourcePackFile,
   getPublicResourcePackPath,
   getPublicResourcePackUrl,
   previewMergedResourcePackConflicts,
   readResourcePackManifest,
   saveUploadedResourcePack,
+  updateBuiltResourcePackMetadata,
   updateBuiltResourcePackImage,
 } from "../services/resourcePacks";
 
@@ -39,9 +43,11 @@ const resourcePackSchema = t.Object({
 const resourcePackBuildSchema = t.Object({
   id: t.String(),
   name: t.String(),
+  description: t.Nullable(t.String()),
   generatedFilename: t.String(),
   publicPath: t.String(),
   publicUrl: t.String(),
+  assignedToServer: t.Boolean(),
   imageFilename: t.Nullable(t.String()),
   imagePublicPath: t.Nullable(t.String()),
   imageUrl: t.Nullable(t.String()),
@@ -59,14 +65,16 @@ const resourcePackBuildDetailSchema = t.Object({
 });
 
 function serializePack(pack: typeof schema.resourcePacks.$inferSelect) {
+  const imageIsAvailable = hasPublicResourcePackFile(pack.imageFilename || pack.imagePublicPath);
+
   return {
     id: pack.id,
     name: pack.name,
     originalFilename: pack.originalFilename,
     storedFilename: pack.storedFilename,
-    imageFilename: pack.imageFilename,
-    imagePublicPath: pack.imagePublicPath,
-    imageUrl: pack.imagePublicPath ? getPublicResourcePackUrl(pack.imagePublicPath) : null,
+    imageFilename: imageIsAvailable ? pack.imageFilename : null,
+    imagePublicPath: imageIsAvailable ? pack.imagePublicPath : null,
+    imageUrl: imageIsAvailable && pack.imagePublicPath ? getBrowserResourcePackUrl(pack.imagePublicPath) : null,
     sha1: pack.sha1,
     sizeBytes: pack.sizeBytes,
     createdAt: pack.createdAt.toISOString(),
@@ -75,17 +83,22 @@ function serializePack(pack: typeof schema.resourcePacks.$inferSelect) {
 
 function serializeBuild(
   build: typeof schema.resourcePackBuilds.$inferSelect,
-  packCount: number
+  packCount: number,
+  options: { assignedToServer?: boolean } = {}
 ) {
+  const imageIsAvailable = hasPublicResourcePackFile(build.imageFilename || build.imagePublicPath);
+
   return {
     id: build.id,
     name: build.name,
+    description: build.description,
     generatedFilename: build.generatedFilename,
     publicPath: build.publicPath,
     publicUrl: getPublicResourcePackUrl(build.publicPath),
-    imageFilename: build.imageFilename,
-    imagePublicPath: build.imagePublicPath,
-    imageUrl: build.imagePublicPath ? getPublicResourcePackUrl(build.imagePublicPath) : null,
+    assignedToServer: options.assignedToServer ?? false,
+    imageFilename: imageIsAvailable ? build.imageFilename : null,
+    imagePublicPath: imageIsAvailable ? build.imagePublicPath : null,
+    imageUrl: imageIsAvailable && build.imagePublicPath ? getBrowserResourcePackUrl(build.imagePublicPath) : null,
     sha1: build.sha1,
     sizeBytes: build.sizeBytes,
     conflictCount: build.conflictCount,
@@ -109,6 +122,13 @@ async function invalidateServerPropertiesCache(serverId: string) {
     cacheKeys.servers.detail(serverId),
     cacheKeys.servers.properties(serverId),
   ]);
+}
+
+function isBuildAssignedToServer(
+  build: typeof schema.resourcePackBuilds.$inferSelect,
+  properties: Record<string, string>
+) {
+  return properties["resource-pack"] === getPublicResourcePackUrl(build.publicPath);
 }
 
 const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
@@ -179,6 +199,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
         await db.delete(schema.resourcePacks).where(eq(schema.resourcePacks.id, id));
         await deleteResourcePackImage(pack.imageFilename);
         await deleteStoredResourcePackByFilename(pack.storedFilename, pack.filePath);
+        await cleanupOrphanedResourcePackFiles();
         return { success: true };
       } catch (err: any) {
         set.status = 500;
@@ -246,8 +267,14 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
         counts.set(item.buildId, (counts.get(item.buildId) || 0) + 1);
       }
 
+      const { properties: currentProperties } = await composeService.readServerProperties(query.serverId);
+
       return {
-        builds: builds.map((build) => serializeBuild(build, counts.get(build.id) || 0)),
+        builds: builds.map((build) =>
+          serializeBuild(build, counts.get(build.id) || 0, {
+            assignedToServer: isBuildAssignedToServer(build, currentProperties),
+          })
+        ),
       };
     },
     {
@@ -262,9 +289,39 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
   .patch(
     "/builds/:id",
     async ({ params: { id }, body, set }) => {
+      const [existingBuild] = await db
+        .select()
+        .from(schema.resourcePackBuilds)
+        .where(and(eq(schema.resourcePackBuilds.id, id), eq(schema.resourcePackBuilds.serverId, body.serverId)))
+        .limit(1);
+
+      if (!existingBuild) {
+        set.status = 404;
+        return { error: "Resource pack build not found" };
+      }
+
+      const nextName = body.name.trim();
+      const nextDescription = body.description?.trim() || null;
+
+      let archiveMeta;
+      try {
+        archiveMeta = await updateBuiltResourcePackMetadata(existingBuild.filePath, existingBuild.generatedFilename, {
+          name: nextName,
+          description: nextDescription,
+        });
+      } catch (err: any) {
+        set.status = 500;
+        return { error: err.message || "Failed to update merged resource pack metadata" };
+      }
+
       const [build] = await db
         .update(schema.resourcePackBuilds)
-        .set({ name: body.name.trim() })
+        .set({
+          name: nextName,
+          description: nextDescription,
+          sha1: archiveMeta.sha1,
+          sizeBytes: archiveMeta.sizeBytes,
+        })
         .where(and(eq(schema.resourcePackBuilds.id, id), eq(schema.resourcePackBuilds.serverId, body.serverId)))
         .returning();
 
@@ -282,7 +339,11 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
     },
     {
       params: t.Object({ id: t.String() }),
-      body: t.Object({ serverId: t.String(), name: t.String({ minLength: 1 }) }),
+      body: t.Object({
+        serverId: t.String(),
+        name: t.String({ minLength: 1 }),
+        description: t.Optional(t.String()),
+      }),
       response: {
         200: t.Object({ build: resourcePackBuildSchema }),
         401: errorResponse,
@@ -305,10 +366,27 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
       }
 
       try {
+        const { properties: currentProperties } = await composeService.readServerProperties(query.serverId);
+        const assignedToServer = isBuildAssignedToServer(build, currentProperties);
+
+        if (assignedToServer) {
+          const nextProperties: Record<string, string> = {
+            ...currentProperties,
+            "resource-pack": "",
+            "resource-pack-sha1": "",
+            "resource-pack-prompt": "",
+            "require-resource-pack": "false",
+          };
+
+          await composeService.writeServerProperties(query.serverId, nextProperties);
+          await invalidateServerPropertiesCache(query.serverId);
+        }
+
         await db.delete(schema.resourcePackBuilds).where(eq(schema.resourcePackBuilds.id, id));
         await deleteResourcePackImage(build.imageFilename);
         await deleteMergedResourcePackFiles(build.generatedFilename);
-        return { success: true };
+        await cleanupOrphanedResourcePackFiles();
+        return { success: true, removedFromServer: assignedToServer };
       } catch (err: any) {
         set.status = 500;
         return { error: err.message || "Failed to delete resource pack build" };
@@ -318,7 +396,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
       params: t.Object({ id: t.String() }),
       query: t.Object({ serverId: t.String() }),
       response: {
-        200: t.Object({ success: t.Boolean() }),
+        200: t.Object({ success: t.Boolean(), removedFromServer: t.Boolean() }),
         401: errorResponse,
         404: errorResponse,
         500: errorResponse,
@@ -560,6 +638,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
         const merged = await buildMergedResourcePack({
           buildId,
           name: body.name,
+          description: body.description?.trim() || null,
           image: body.image || null,
           packs: orderedPacks.map((pack) => ({
             id: pack.id,
@@ -575,6 +654,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
             id: buildId,
             serverId: body.serverId,
             name: body.name,
+            description: body.description?.trim() || null,
             generatedFilename: merged.generatedFilename,
             filePath: merged.filePath,
             publicPath: merged.publicPath,
@@ -596,10 +676,10 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
           );
         }
 
-        return {
-          build: serializeBuild(build, orderedPacks.length),
-          conflicts: merged.conflictPaths,
-        };
+      return {
+        build: serializeBuild(build, orderedPacks.length),
+        conflicts: merged.conflictPaths,
+      };
       } catch (err: any) {
         set.status = 500;
         return { error: err.message || "Failed to build merged resource pack" };
@@ -609,6 +689,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
       body: t.Object({
         serverId: t.String(),
         name: t.String(),
+        description: t.Optional(t.String()),
         packIds: t.Array(t.String(), { minItems: 1 }),
         image: t.Optional(t.File()),
       }),
@@ -672,7 +753,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
         return {
           success: true,
           serverId: server.id,
-          build: serializeBuild(build, buildItems.length),
+          build: serializeBuild(build, buildItems.length, { assignedToServer: true }),
           properties: {
             "resource-pack": nextProperties["resource-pack"],
             "resource-pack-sha1": nextProperties["resource-pack-sha1"],
