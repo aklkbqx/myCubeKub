@@ -22,6 +22,7 @@ import {
   updateBuiltResourcePackMetadata,
   updateBuiltResourcePackImage,
 } from "../services/resourcePacks";
+import { MAX_UPLOAD_SIZE_BYTES } from "../utils/uploadLimits";
 
 const errorResponse = t.Object({
   error: t.String(),
@@ -598,7 +599,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
     {
       body: t.Object({
         serverId: t.String(),
-        file: t.File(),
+        file: t.File({ maxSize: MAX_UPLOAD_SIZE_BYTES }),
         name: t.Optional(t.String()),
       }),
       response: {
@@ -658,7 +659,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
     },
     {
       params: t.Object({ id: t.String() }),
-      body: t.Object({ file: t.File() }),
+      body: t.Object({ file: t.File({ maxSize: MAX_UPLOAD_SIZE_BYTES }) }),
       response: {
         200: t.Object({ build: resourcePackBuildSchema }),
         401: errorResponse,
@@ -752,7 +753,7 @@ const resourcePackRoutes = new Elysia({ prefix: "/resource-packs" })
         name: t.String(),
         description: t.Optional(t.String()),
         packIds: t.Array(t.String(), { minItems: 1 }),
-        image: t.Optional(t.File()),
+        image: t.Optional(t.File({ maxSize: MAX_UPLOAD_SIZE_BYTES })),
       }),
       response: {
         200: t.Object({

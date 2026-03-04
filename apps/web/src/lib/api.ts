@@ -128,6 +128,56 @@ class ApiClient {
     });
   }
 
+  private async uploadFileWithProgress<T>(
+    input: string,
+    file: File,
+    headers?: Record<string, string>,
+    onProgress?: (progress: { loaded: number; total: number; percent: number }) => void
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", input, true);
+      xhr.withCredentials = true;
+
+      Object.entries(headers || {}).forEach(([key, value]) => {
+        xhr.setRequestHeader(key, value);
+      });
+
+      xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable || !onProgress) return;
+
+        onProgress({
+          loaded: event.loaded,
+          total: event.total,
+          percent: Math.round((event.loaded / event.total) * 100),
+        });
+      };
+
+      xhr.onerror = () => reject(new ApiError(0, "Upload failed"));
+
+      xhr.onload = () => {
+        const payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+
+        if (xhr.status < 200 || xhr.status >= 300) {
+          const message =
+            payload &&
+            typeof payload === "object" &&
+            "error" in payload &&
+            typeof payload.error === "string"
+              ? payload.error
+              : "Request failed";
+
+          reject(new ApiError(xhr.status, message));
+          return;
+        }
+
+        resolve(payload as T);
+      };
+
+      xhr.send(file);
+    });
+  }
+
   // ─── Auth ────────────────────────────────────────────────
   auth = {
     login: (username: string, password: string): Promise<{ user: { id: string; username: string } }> =>
@@ -257,25 +307,22 @@ class ApiClient {
       path?: string,
       onProgress?: (progress: { loaded: number; total: number; percent: number }) => void
     ): Promise<{ success: boolean; filename: string }> => {
-      if (onProgress) {
-        const formData = new FormData();
-        formData.append("file", file);
-        if (path) {
-          formData.append("path", path);
-        }
-
-        return this.uploadFormDataWithProgress<{ success: boolean; filename: string }>(
-          `${API_BASE}/servers/${encodeURIComponent(serverId)}/files/upload`,
-          formData,
-          onProgress
-        );
+      const searchParams = new URLSearchParams();
+      const normalizedPath = this.normalizeOptionalPath(path);
+      if (normalizedPath) {
+        searchParams.set("path", normalizedPath);
       }
 
-      return this.unwrap<{ success: boolean; filename: string }>(
-        treaty.servers[serverId].files.upload.post({
-          file,
-          ...this.optionalPathQuery(path),
-        })
+      const uploadUrl = `${API_BASE}/servers/${encodeURIComponent(serverId)}/files/upload-stream${searchParams.size ? `?${searchParams.toString()}` : ""}`;
+
+      return this.uploadFileWithProgress<{ success: boolean; filename: string }>(
+        uploadUrl,
+        file,
+        {
+          "Content-Type": file.type || "application/octet-stream",
+          "X-File-Name": encodeURIComponent(file.name),
+        },
+        onProgress
       );
     },
 

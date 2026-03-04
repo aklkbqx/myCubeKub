@@ -6,8 +6,12 @@ import { getServerDir } from "../services/compose";
 import { readdir, stat, mkdir, rm, rename, readFile, writeFile } from "fs/promises";
 import { join, basename } from "path";
 import { existsSync } from "fs";
+import { createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
 import { cacheService } from "../services/CacheService";
 import { CACHE_TTL, cacheKeys } from "../services/cacheKeys";
+import { MAX_UPLOAD_SIZE_BYTES } from "../utils/uploadLimits";
 
 const errorResponse = t.Object({
   error: t.String(),
@@ -390,8 +394,7 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
 
         const file = body.file;
         const filePath = join(uploadDir, file.name);
-        const arrayBuffer = await file.arrayBuffer();
-        await writeFile(filePath, Buffer.from(arrayBuffer));
+        await Bun.write(filePath, file);
         await invalidateFileCache(id);
 
         return { success: true, filename: file.name };
@@ -403,7 +406,7 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
     {
       params: t.Object({ id: t.String() }),
       body: t.Object({
-        file: t.File(),
+        file: t.File({ maxSize: MAX_UPLOAD_SIZE_BYTES }),
         path: t.Optional(t.String()),
       }),
       response: {
@@ -413,6 +416,78 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
         }),
         401: errorResponse,
         404: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+  .put(
+    "/:id/files/upload-stream",
+    async ({ params: { id }, query, request, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      const contentLengthHeader = request.headers.get("content-length");
+      const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+      if (Number.isFinite(contentLength) && contentLength > MAX_UPLOAD_SIZE_BYTES) {
+        set.status = 413;
+        return { error: "File too large" };
+      }
+
+      const rawFileName = request.headers.get("x-file-name");
+      if (!rawFileName) {
+        set.status = 400;
+        return { error: "Missing file name" };
+      }
+
+      const fileName = basename(decodeURIComponent(rawFileName));
+      if (!fileName || fileName === "." || fileName === "..") {
+        set.status = 400;
+        return { error: "Invalid file name" };
+      }
+
+      if (!request.body) {
+        set.status = 400;
+        return { error: "Missing file body" };
+      }
+
+      try {
+        const uploadDir = safePath(id, normalizeRelativePath(query.path));
+        if (!existsSync(uploadDir)) {
+          await mkdir(uploadDir, { recursive: true });
+        }
+
+        const filePath = join(uploadDir, fileName);
+        await pipeline(Readable.fromWeb(request.body as any), createWriteStream(filePath));
+        await invalidateFileCache(id);
+
+        return { success: true, filename: fileName };
+      } catch (err: any) {
+        set.status = 500;
+        return { error: err.message || "Failed to upload file" };
+      }
+    },
+    {
+      params: t.Object({ id: t.String() }),
+      query: t.Object({
+        path: t.Optional(t.String()),
+      }),
+      response: {
+        200: t.Object({
+          success: t.Boolean(),
+          filename: t.String(),
+        }),
+        400: errorResponse,
+        401: errorResponse,
+        404: errorResponse,
+        413: errorResponse,
         500: errorResponse,
       },
     }

@@ -27,6 +27,7 @@ import { resolveLocaleFromAcceptLanguage } from './utils/locale';
 import { CACHE_TTL, cacheKeys } from './services/cacheKeys';
 import { rateLimitPresets } from './services/rateLimiter';
 import { getPublicResourcePackPath } from './services/resourcePacks';
+import { MAX_UPLOAD_SIZE_BYTES } from './utils/uploadLimits';
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -153,7 +154,11 @@ Object.entries(requiredEnvVars).forEach(([key, value]) => {
 });
 
 const createBaseApp = () => {
-  const app = new Elysia()
+  const app = new Elysia({
+    serve: {
+      maxRequestBodySize: MAX_UPLOAD_SIZE_BYTES,
+    },
+  })
     .use(cors(corsConfig))
     .use(rateLimitPresets.auth)
     .use(rateLimitPresets.files)
