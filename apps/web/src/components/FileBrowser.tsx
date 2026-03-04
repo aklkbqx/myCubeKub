@@ -4,7 +4,7 @@ import { ApiError, api, type FileInfo } from "@/lib/api";
 import { formatBytes } from "@/lib/utils";
 import {
     Folder, File, ArrowLeft, Trash2, Download, Upload,
-    FolderPlus, Edit3, X, Check, Inbox, HardDriveDownload, Search, ArrowUpDown, FolderUp, Folders,
+    FolderPlus, Edit3, X, Check, Inbox, HardDriveDownload, Search, ArrowUpDown, FolderUp,
 } from "lucide-react";
 import { LoadingOverlay } from "./LoadingOverlay";
 import SelectDropdown from "./SelectDropdown";
@@ -109,6 +109,80 @@ function getFileRelativeDirectory(file: File) {
 }
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+const ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
+const ZIP_CENTRAL_FILE_HEADER_SIGNATURE = 0x02014b50;
+const ZIP_END_OF_CENTRAL_DIR_SIGNATURE = 0x06054b50;
+const MAX_ARCHIVE_UPLOAD_BYTES = 1024 * 1024 * 1024;
+const SMART_ARCHIVE_MIN_FILES = 24;
+const textEncoder = new TextEncoder();
+
+const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i += 1) {
+        let c = i;
+        for (let j = 0; j < 8; j += 1) {
+            c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        }
+        table[i] = c >>> 0;
+    }
+    return table;
+})();
+
+function crc32(data: Uint8Array) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < data.length; i += 1) {
+        crc = CRC32_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+function toDosTime(date: Date) {
+    const hours = Math.min(23, Math.max(0, date.getHours()));
+    const minutes = Math.min(59, Math.max(0, date.getMinutes()));
+    const seconds = Math.min(59, Math.max(0, Math.floor(date.getSeconds() / 2)));
+    return (hours << 11) | (minutes << 5) | seconds;
+}
+
+function toDosDate(date: Date) {
+    const year = Math.max(1980, date.getFullYear());
+    const month = Math.min(12, Math.max(1, date.getMonth() + 1));
+    const day = Math.min(31, Math.max(1, date.getDate()));
+    return ((year - 1980) << 9) | (month << 5) | day;
+}
+
+function concatBytes(chunks: Uint8Array[]) {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return merged;
+}
+
+async function readFileBytesWithRetry(file: File, attempts = 3) {
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            return new Uint8Array(await file.arrayBuffer());
+        } catch (err: any) {
+            lastError = err;
+            if (attempt < attempts) {
+                await wait(120 * attempt);
+            }
+        }
+    }
+    throw lastError || new Error("Unable to read local file");
+}
+
+function writeU16(view: DataView, offset: number, value: number) {
+    view.setUint16(offset, value & 0xffff, true);
+}
+
+function writeU32(view: DataView, offset: number, value: number) {
+    view.setUint32(offset, value >>> 0, true);
+}
 
 function toPathSegments(path: string) {
     return path.split("/").filter(Boolean);
@@ -116,6 +190,18 @@ function toPathSegments(path: string) {
 
 function normalizeRelativeDir(path: string) {
     return sanitizeRelativePath(toPathSegments(path).join("/"));
+}
+
+function isLikelyDirectoryPlaceholder(candidate: UploadCandidate, discoveredDirectories: Set<string>) {
+    const relativeDir = normalizeRelativeDir(candidate.relativeDir || "");
+    const fullPath = sanitizeRelativePath(normalizeJoinPath(relativeDir, candidate.file.name));
+    if (!fullPath) return false;
+    // If root-level file candidate has exactly the same path as a discovered directory,
+    // it's a browser directory placeholder and should not be uploaded as a file.
+    if (!relativeDir && discoveredDirectories.has(fullPath)) {
+        return true;
+    }
+    return false;
 }
 
 async function collectDropCandidates(
@@ -134,27 +220,28 @@ async function collectDropCandidates(
 
     const readDirectoryEntries = async (reader: any): Promise<any[]> => {
         const entries: any[] = [];
-        let exhausted = false;
+        let page = 0;
         while (true) {
-            const chunk = await Promise.race([
-                new Promise<any[]>((resolve) => {
-                    reader.readEntries((batch: any[]) => resolve(batch || []), () => resolve([]));
-                }),
-                new Promise<any[]>((resolve) => {
-                    window.setTimeout(() => {
-                        exhausted = true;
-                        resolve([]);
-                    }, 2500);
-                }),
-            ]);
-            if (exhausted) {
-                break;
-            }
+            const chunk = await new Promise<any[]>((resolve, reject) => {
+                try {
+                    reader.readEntries(
+                        (batch: any[]) => resolve(batch || []),
+                        (err: any) => reject(err || new Error("Failed to read directory entries"))
+                    );
+                } catch (err) {
+                    reject(err);
+                }
+            });
+
             if (!chunk.length) {
                 break;
             }
-            for (const entry of chunk) {
-                entries.push(entry);
+
+            entries.push(...chunk);
+            page += 1;
+            // Safety guard against endless browser read loops while still preferring completeness.
+            if (page > 100_000) {
+                throw new Error("Directory read exceeded safe page limit");
             }
         }
         return entries;
@@ -217,10 +304,10 @@ async function collectDropCandidates(
             for (const child of children) {
                 await traverseEntry(child, nextParent);
             }
-        } catch {
+        } catch (err: any) {
             skipped.push({
                 path: sanitizeRelativePath(normalizeJoinPath(safeParentDir, entry.name || "")),
-                reason: "Failed to traverse dropped directory",
+                reason: err?.message || "Failed to traverse dropped directory",
             });
         }
     };
@@ -233,47 +320,60 @@ async function collectDropCandidates(
         }
     }
 
-    const mergedByKey = new Map<string, UploadCandidate>();
+    const mergedByPath = new Map<string, UploadCandidate>();
     const looseFingerprints = new Map<string, string>();
     const allCandidates = [...collectedFromEntries, ...fromFileList];
 
     for (const candidate of allCandidates) {
         const relativeDir = normalizeRelativeDir(candidate.relativeDir || "");
         const normalizedCandidate: UploadCandidate = { file: candidate.file, relativeDir };
-        const fullKey = uploadCandidateKey(normalizedCandidate);
-        const looseKey = `${normalizedCandidate.file.name}:${normalizedCandidate.file.size}:${normalizedCandidate.file.lastModified}`;
-        const existingFull = mergedByKey.get(fullKey);
-        if (existingFull) {
+        if (isLikelyDirectoryPlaceholder(normalizedCandidate, discoveredDirectories)) {
             continue;
         }
-
+        const pathKey = uploadCandidatePathKey(normalizedCandidate);
+        if (!pathKey) {
+            continue;
+        }
+        const existingByPath = mergedByPath.get(pathKey);
+        if (existingByPath) {
+            if (!existingByPath.relativeDir && normalizedCandidate.relativeDir) {
+                mergedByPath.set(pathKey, normalizedCandidate);
+            }
+            continue;
+        }
+        const looseKey = `${normalizedCandidate.file.name}:${normalizedCandidate.file.size}:${normalizedCandidate.file.lastModified}`;
         const preferredKey = looseFingerprints.get(looseKey);
         if (preferredKey) {
-            const existingPreferred = mergedByKey.get(preferredKey);
+            const existingPreferred = mergedByPath.get(preferredKey);
             if (existingPreferred && !existingPreferred.relativeDir && relativeDir) {
-                mergedByKey.delete(preferredKey);
-                mergedByKey.set(fullKey, normalizedCandidate);
-                looseFingerprints.set(looseKey, fullKey);
+                mergedByPath.delete(preferredKey);
+                mergedByPath.set(pathKey, normalizedCandidate);
+                looseFingerprints.set(looseKey, pathKey);
             } else if (existingPreferred && existingPreferred.relativeDir && !relativeDir) {
                 continue;
             } else {
-                mergedByKey.set(fullKey, normalizedCandidate);
+                mergedByPath.set(pathKey, normalizedCandidate);
+                looseFingerprints.set(looseKey, pathKey);
             }
             continue;
         }
 
-        mergedByKey.set(fullKey, normalizedCandidate);
-        looseFingerprints.set(looseKey, fullKey);
+        mergedByPath.set(pathKey, normalizedCandidate);
+        looseFingerprints.set(looseKey, pathKey);
     }
 
     const result: DropCollectionResult = {
-        candidates: Array.from(mergedByKey.values()),
+        candidates: Array.from(mergedByPath.values()),
         directories: Array.from(discoveredDirectories),
         stats: {
-            expected: event.dataTransfer.files?.length ?? 0,
+            expected: Math.max(
+                event.dataTransfer.files?.length ?? 0,
+                fromFileList.length,
+                collectedFromEntries.length + skipped.length
+            ),
             fromEntries: collectedFromEntries.length,
             fromFileList: fromFileList.length,
-            merged: mergedByKey.size,
+            merged: mergedByPath.size,
             skipped,
         },
     };
@@ -342,8 +442,138 @@ function collectDirectoriesFromCandidates(candidates: UploadCandidate[]) {
     return Array.from(directories);
 }
 
-function uploadCandidateKey(candidate: UploadCandidate) {
-    return `${normalizeRelativeDir(candidate.relativeDir || "")}/${candidate.file.name}:${candidate.file.size}:${candidate.file.lastModified}`;
+type ZipBuildResult = {
+    blob: Blob;
+    archivedFilePaths: string[];
+    skipped: SkippedCollectionItem[];
+};
+
+async function buildZipArchiveBlob(candidates: UploadCandidate[], directories: string[]): Promise<ZipBuildResult> {
+    const directorySet = new Set<string>(
+        directories
+            .map((dir) => normalizeRelativeDir(dir))
+            .filter(Boolean)
+    );
+    const skipped: SkippedCollectionItem[] = [];
+    const archivedFilePaths: string[] = [];
+
+    const fileEntries = await Promise.all(
+        candidates.map(async (candidate) => {
+            const relativeDir = normalizeRelativeDir(candidate.relativeDir || "");
+            const relativePath = sanitizeRelativePath(normalizeJoinPath(relativeDir, candidate.file.name));
+            if (!relativePath) return null;
+
+            let data: Uint8Array;
+            try {
+                data = await readFileBytesWithRetry(candidate.file, 3);
+            } catch (err: any) {
+                skipped.push({
+                    path: relativePath,
+                    reason: err?.message || "Unable to read local file for archive upload after retries",
+                });
+                return null;
+            }
+            const parts = relativePath.split("/").filter(Boolean);
+            for (let i = 1; i < parts.length; i += 1) {
+                directorySet.add(parts.slice(0, i).join("/"));
+            }
+            archivedFilePaths.push(relativePath);
+
+            return {
+                name: relativePath,
+                data,
+                crc: crc32(data),
+                date: new Date(candidate.file.lastModified || Date.now()),
+                isDirectory: false,
+            };
+        })
+    );
+
+    const normalizedFileEntries = fileEntries.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+    if (normalizedFileEntries.length === 0) {
+        throw new Error("No readable files were found in the selected folder.");
+    }
+    const directoryEntries = Array.from(directorySet)
+        .map((dir) => ({
+            name: `${dir.replace(/\/+$/, "")}/`,
+            data: new Uint8Array(0),
+            crc: 0,
+            date: new Date(),
+            isDirectory: true,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+    const entries = [...directoryEntries, ...normalizedFileEntries];
+    const localParts: Uint8Array[] = [];
+    const centralParts: Uint8Array[] = [];
+    let offset = 0;
+
+    for (const entry of entries) {
+        const nameBytes = textEncoder.encode(entry.name);
+        const localHeader = new Uint8Array(30);
+        const localView = new DataView(localHeader.buffer);
+        writeU32(localView, 0, ZIP_LOCAL_FILE_HEADER_SIGNATURE);
+        writeU16(localView, 4, 20);
+        writeU16(localView, 6, 0);
+        writeU16(localView, 8, 0);
+        writeU16(localView, 10, toDosTime(entry.date));
+        writeU16(localView, 12, toDosDate(entry.date));
+        writeU32(localView, 14, entry.crc);
+        writeU32(localView, 18, entry.data.length);
+        writeU32(localView, 22, entry.data.length);
+        writeU16(localView, 26, nameBytes.length);
+        writeU16(localView, 28, 0);
+
+        const localOffset = offset;
+        localParts.push(localHeader, nameBytes, entry.data);
+        offset += localHeader.length + nameBytes.length + entry.data.length;
+
+        const centralHeader = new Uint8Array(46);
+        const centralView = new DataView(centralHeader.buffer);
+        writeU32(centralView, 0, ZIP_CENTRAL_FILE_HEADER_SIGNATURE);
+        writeU16(centralView, 4, 20);
+        writeU16(centralView, 6, 20);
+        writeU16(centralView, 8, 0);
+        writeU16(centralView, 10, 0);
+        writeU16(centralView, 12, toDosTime(entry.date));
+        writeU16(centralView, 14, toDosDate(entry.date));
+        writeU32(centralView, 16, entry.crc);
+        writeU32(centralView, 20, entry.data.length);
+        writeU32(centralView, 24, entry.data.length);
+        writeU16(centralView, 28, nameBytes.length);
+        writeU16(centralView, 30, 0);
+        writeU16(centralView, 32, 0);
+        writeU16(centralView, 34, 0);
+        writeU16(centralView, 36, 0);
+        writeU32(centralView, 38, entry.isDirectory ? 0x10 : 0);
+        writeU32(centralView, 42, localOffset);
+        centralParts.push(centralHeader, nameBytes);
+    }
+
+    const centralDirectory = concatBytes(centralParts);
+    const localData = concatBytes(localParts);
+    const endHeader = new Uint8Array(22);
+    const endView = new DataView(endHeader.buffer);
+    writeU32(endView, 0, ZIP_END_OF_CENTRAL_DIR_SIGNATURE);
+    writeU16(endView, 4, 0);
+    writeU16(endView, 6, 0);
+    writeU16(endView, 8, entries.length);
+    writeU16(endView, 10, entries.length);
+    writeU32(endView, 12, centralDirectory.length);
+    writeU32(endView, 16, localData.length);
+    writeU16(endView, 20, 0);
+
+    return {
+        blob: new Blob([localData, centralDirectory, endHeader], { type: "application/zip" }),
+        archivedFilePaths,
+        skipped,
+    };
+}
+
+function uploadCandidatePathKey(candidate: UploadCandidate) {
+    return sanitizeRelativePath(
+        normalizeJoinPath(normalizeRelativeDir(candidate.relativeDir || ""), candidate.file.name)
+    );
 }
 
 type FileFilterMode = "all" | "files" | "folders";
@@ -384,7 +614,6 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
     const [filterMode, setFilterMode] = useState<FileFilterMode>("all");
     const [sortMode, setSortMode] = useState<FileSortMode>("name-asc");
     const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
-    const [queuedFolderCandidates, setQueuedFolderCandidates] = useState<UploadCandidate[]>([]);
     const [collectionWarning, setCollectionWarning] = useState("");
     const [lastUploadSummary, setLastUploadSummary] = useState<UploadSummary | null>(null);
     const [deleteConfirm, setDeleteConfirm] = useState<FileDeleteConfirmState | null>(null);
@@ -392,7 +621,6 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
     const dragDepthRef = useRef(0);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const folderInputRef = useRef<HTMLInputElement | null>(null);
-    const batchFolderInputRef = useRef<HTMLInputElement | null>(null);
     const recentUploadTimeoutRef = useRef<number | null>(null);
     const uploadCancelRef = useRef<(() => void) | null>(null);
     const uploadCanceledRef = useRef(false);
@@ -402,13 +630,19 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
             ? currentPath
             : "";
 
-    const fetchFiles = useCallback(async (options?: { silent?: boolean }) => {
+    const fetchFiles = useCallback(async (options?: { silent?: boolean; resetIndicators?: boolean }) => {
         const silent = options?.silent ?? false;
+        const resetIndicators = options?.resetIndicators ?? false;
 
         if (silent) {
             setRefreshing(true);
         } else {
             setLoading(true);
+        }
+        if (resetIndicators) {
+            setCollectionWarning("");
+            setLastUploadSummary(null);
+            setError("");
         }
         setError("");
         try {
@@ -437,7 +671,7 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
 
     useEffect(() => {
         const interval = setInterval(() => {
-            void fetchFiles({ silent: true });
+            void fetchFiles({ silent: true, resetIndicators: true });
         }, 5_000);
 
         return () => clearInterval(interval);
@@ -514,6 +748,8 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
             expectedFiles?: number;
             skippedDuringCollection?: SkippedCollectionItem[];
             directoriesToEnsure?: string[];
+            useArchiveForFolders?: boolean;
+            forceArchiveUpload?: boolean;
         }
     ) => {
         const candidates: UploadCandidate[] = Array.isArray(input)
@@ -541,7 +777,6 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         setUploading(true);
         uploadCanceledRef.current = false;
         setError("");
-        setCollectionWarning("");
         setLastUploadSummary(null);
         setFolderDropTarget(null);
         setUploadState({
@@ -553,7 +788,7 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         });
 
         const expectedFiles = options?.expectedFiles ?? uploadItems.length;
-        const skippedDuringCollection = options?.skippedDuringCollection || [];
+        const skippedDuringCollection = [...(options?.skippedDuringCollection || [])];
         const candidateDirectories = options?.preserveRelativeDirectories
             ? collectDirectoriesFromCandidates(candidates)
             : [];
@@ -564,8 +799,104 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         const successfulUploadPaths: string[] = [];
         let failedCount = 0;
         let completedCount = 0;
+        let preparedCount = uploadItems.length;
+        let terminalErrorMessage = "";
+        const shouldPreserveRelativeDirectories = Boolean(options?.preserveRelativeDirectories);
+        const hasRelativeDirectories = candidates.some(
+            (candidate) => normalizeRelativeDir(candidate.relativeDir || getFileRelativeDirectory(candidate.file)).length > 0
+        );
+        const shouldUseArchiveUpload =
+            Boolean(options?.forceArchiveUpload) ||
+            Boolean(options?.useArchiveForFolders) ||
+            shouldPreserveRelativeDirectories ||
+            uploadItems.length > 1 ||
+            (uploadItems.length >= SMART_ARCHIVE_MIN_FILES && (hasRelativeDirectories || !targetPath));
+        let archiveUploaded = false;
+        let fallbackToDirectUpload = false;
 
-        if (directoriesToEnsure.length > 0) {
+        if (shouldUseArchiveUpload) {
+            try {
+                setUploadState({
+                    targetPath: firstPath || "data",
+                    totalFiles: uploadItems.length,
+                    completedFiles: 0,
+                    currentFileName: "Preparing folder archive...",
+                    percent: 0,
+                });
+
+                const zipBuild = await buildZipArchiveBlob(candidates, directoriesToEnsure);
+                skippedDuringCollection.push(...zipBuild.skipped);
+                preparedCount = zipBuild.archivedFilePaths.length;
+
+                if (zipBuild.blob.size > MAX_ARCHIVE_UPLOAD_BYTES) {
+                    terminalErrorMessage = `Folder archive is too large (${formatBytes(zipBuild.blob.size)}). Maximum upload size is ${formatBytes(MAX_ARCHIVE_UPLOAD_BYTES)}.`;
+                    setError(terminalErrorMessage);
+                    throw new Error(terminalErrorMessage);
+                }
+                let attempt = 0;
+
+                while (!archiveUploaded) {
+                    try {
+                        await api.files.uploadArchive(serverId, zipBuild.blob, basePath || undefined, (progress) => {
+                            setUploadState({
+                                targetPath: firstPath || "data",
+                                totalFiles: uploadItems.length,
+                                completedFiles: completedCount,
+                                currentFileName: "Uploading folder archive...",
+                                percent: Math.max(1, Math.round(progress.percent)),
+                            });
+                        });
+                        archiveUploaded = true;
+                    } catch (err: any) {
+                        if (uploadCanceledRef.current) break;
+
+                        const isRateLimited = err instanceof ApiError && err.status === 429;
+                        if (isRateLimited && attempt < 3) {
+                            attempt += 1;
+                            const retryDelayMs = 1000 * attempt;
+                            setError(`Rate limit reached, retrying folder archive (${attempt}/3)...`);
+                            await wait(retryDelayMs);
+                            continue;
+                        }
+
+                        if (err instanceof ApiError && err.status === 404) {
+                            fallbackToDirectUpload = true;
+                            setCollectionWarning("Archive upload endpoint is unavailable. Falling back to direct upload.");
+                            break;
+                        } else {
+                            terminalErrorMessage = err?.message || "Failed to upload folder archive";
+                        }
+                        if (terminalErrorMessage) {
+                            failedCount = uploadItems.length;
+                            setError(terminalErrorMessage);
+                        }
+                        break;
+                    }
+                }
+
+                if (archiveUploaded) {
+                    completedCount = zipBuild.archivedFilePaths.length;
+                    successfulUploadPaths.push(...zipBuild.archivedFilePaths);
+                    setUploadState({
+                        targetPath: firstPath || "data",
+                        totalFiles: uploadItems.length,
+                        completedFiles: completedCount,
+                        currentFileName: "Archive extracted",
+                        percent: 100,
+                    });
+                } else if (!terminalErrorMessage && !uploadCanceledRef.current && !fallbackToDirectUpload) {
+                    failedCount += uploadItems.length;
+                }
+            } catch (err: any) {
+                if (!terminalErrorMessage) {
+                    failedCount += uploadItems.length;
+                    terminalErrorMessage = err?.message || "Failed to build folder archive";
+                    setError(terminalErrorMessage);
+                }
+            }
+        }
+
+        if (!archiveUploaded && directoriesToEnsure.length > 0) {
             for (const relativeDir of directoriesToEnsure) {
                 const targetDir = normalizeJoinPath(basePath, relativeDir);
                 try {
@@ -573,12 +904,13 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                 } catch (err: any) {
                     if (uploadCanceledRef.current) break;
                     failedCount += 1;
-                    setError(err?.message || `Failed to prepare folder "${targetDir}"`);
+                    terminalErrorMessage = err?.message || `Failed to prepare folder "${targetDir}"`;
+                    setError(terminalErrorMessage);
                 }
             }
         }
 
-        for (let index = 0; index < uploadItems.length; index += 1) {
+        for (let index = 0; index < uploadItems.length && !archiveUploaded; index += 1) {
             if (uploadCanceledRef.current) break;
 
             const item = uploadItems[index];
@@ -615,7 +947,8 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                     }
 
                     failedCount += 1;
-                    setError(err?.message || `Failed to upload ${item.file.name}`);
+                    terminalErrorMessage = err?.message || `Failed to upload ${item.file.name}`;
+                    setError(terminalErrorMessage);
                     break;
                 } finally {
                     uploadCancelRef.current = null;
@@ -654,11 +987,13 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
             await fetchFiles();
         }
 
-        const uploaded = Math.max(uploadItems.length - failedCount, 0);
-        const missingBeforeUpload = Math.max(expectedFiles - uploadItems.length, 0);
+        const uploaded = archiveUploaded
+            ? completedCount
+            : Math.max(uploadItems.length - failedCount, 0);
+        const missingBeforeUpload = Math.max(expectedFiles - preparedCount, 0);
         setLastUploadSummary({
             expected: expectedFiles,
-            prepared: uploadItems.length,
+            prepared: preparedCount,
             uploaded,
             failed: failedCount,
             missingBeforeUpload,
@@ -667,7 +1002,7 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         if (import.meta.env.DEV) {
             console.info("[FileBrowser] Upload summary", {
                 expected: expectedFiles,
-                prepared: uploadItems.length,
+                prepared: preparedCount,
                 uploaded,
                 failed: failedCount,
                 missingBeforeUpload,
@@ -678,6 +1013,8 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
 
         if (uploadCanceledRef.current) {
             setError("Upload canceled.");
+        } else if (terminalErrorMessage) {
+            setError(terminalErrorMessage);
         } else if (failedCount > 0) {
             setError(`Upload completed with ${failedCount} failed file${failedCount > 1 ? "s" : ""}.`);
         } else if (skippedDuringCollection.length > 0 || missingBeforeUpload > 0) {
@@ -704,10 +1041,6 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
 
     const handleUploadFolder = async () => {
         folderInputRef.current?.click();
-    };
-
-    const handleQueueFolders = async () => {
-        batchFolderInputRef.current?.click();
     };
 
     const handleFileSelection = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -766,12 +1099,13 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
             setCollectionWarning("");
         }
 
-        const shouldPreserveRelativeDirectories = candidates.some((item) => Boolean(item.relativeDir));
+        const shouldPreserveRelativeDirectories = true;
         await uploadFiles(candidates, undefined, {
             preserveRelativeDirectories: shouldPreserveRelativeDirectories,
             expectedFiles: stats.expected,
             skippedDuringCollection: stats.skipped,
             directoriesToEnsure: directories,
+            useArchiveForFolders: true,
         });
     };
 
@@ -798,12 +1132,13 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
             setCollectionWarning("");
         }
 
-        const shouldPreserveRelativeDirectories = candidates.some((item) => Boolean(item.relativeDir));
+        const shouldPreserveRelativeDirectories = true;
         await uploadFiles(candidates, folderPath, {
             preserveRelativeDirectories: shouldPreserveRelativeDirectories,
             expectedFiles: stats.expected,
             skippedDuringCollection: stats.skipped,
             directoriesToEnsure: directories,
+            useArchiveForFolders: true,
         });
     };
 
@@ -822,36 +1157,9 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         await uploadFiles(selectedFiles, undefined, {
             preserveRelativeDirectories: true,
             expectedFiles: files.length,
+            useArchiveForFolders: true,
         });
         e.target.value = "";
-    };
-
-    const handleBatchFolderSelection = (e: ChangeEvent<HTMLInputElement>) => {
-        const selectedFiles = e.target.files;
-        if (!selectedFiles?.length) return;
-
-        const added = toUploadCandidates(selectedFiles);
-        setQueuedFolderCandidates((prev) => {
-            const seen = new Set(prev.map(uploadCandidateKey));
-            const merged = [...prev];
-            for (const candidate of added) {
-                const key = uploadCandidateKey(candidate);
-                if (seen.has(key)) continue;
-                seen.add(key);
-                merged.push(candidate);
-            }
-            return merged;
-        });
-        e.target.value = "";
-    };
-
-    const handleUploadQueuedFolders = async () => {
-        if (queuedFolderCandidates.length === 0) return;
-        await uploadFiles(queuedFolderCandidates, undefined, {
-            preserveRelativeDirectories: true,
-            expectedFiles: queuedFolderCandidates.length,
-        });
-        setQueuedFolderCandidates([]);
     };
 
     const handleFileClick = (file: FileInfo) => {
@@ -1087,14 +1395,6 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                 onChange={handleFolderSelection}
                 {...({ webkitdirectory: "", directory: "" } as any)}
             />
-            <input
-                ref={batchFolderInputRef}
-                type="file"
-                multiple
-                className="hidden"
-                onChange={handleBatchFolderSelection}
-                {...({ webkitdirectory: "", directory: "" } as any)}
-            />
             {error && (
                 <div className="mb-4 rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-300">
                     {error}
@@ -1150,29 +1450,6 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                             )}
                         </div>
                     )}
-                </div>
-            )}
-            {queuedFolderCandidates.length > 0 && (
-                <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-brand-500/20 bg-brand-500/10 px-4 py-3 text-xs text-surface-200">
-                    <span className="rounded-full border border-brand-500/30 bg-brand-500/15 px-2.5 py-1 font-medium text-brand-200">
-                        {queuedFolderCandidates.length} files queued from folders
-                    </span>
-                    <button
-                        type="button"
-                        onClick={() => void handleUploadQueuedFolders()}
-                        disabled={uploading}
-                        className="rounded-lg border border-brand-500/30 bg-brand-500/15 px-2.5 py-1 font-medium text-brand-100 transition-colors hover:bg-brand-500/20 disabled:opacity-50"
-                    >
-                        Upload queued folders
-                    </button>
-                    <button
-                        type="button"
-                        onClick={() => setQueuedFolderCandidates([])}
-                        disabled={uploading}
-                        className="rounded-lg border border-surface-700/70 bg-surface-900/60 px-2.5 py-1 text-surface-300 transition-colors hover:bg-surface-800 disabled:opacity-50"
-                    >
-                        Clear queue
-                    </button>
                 </div>
             )}
             {uploadState && (
@@ -1258,15 +1535,6 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                             aria-label="Upload folder"
                         >
                             <FolderUp size={16} />
-                        </button>
-                    </IconTooltip>
-                    <IconTooltip label="Queue folders">
-                        <button
-                            onClick={handleQueueFolders}
-                            className="btn-icon text-surface-400 hover:text-surface-200"
-                            aria-label="Queue folders"
-                        >
-                            <Folders size={16} />
                         </button>
                     </IconTooltip>
                     <IconTooltip label="Create folder">

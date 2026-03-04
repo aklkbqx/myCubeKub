@@ -105,22 +105,42 @@ class ApiClient {
         });
       };
 
-      xhr.onerror = () => reject(new ApiError(0, "Upload failed"));
+      xhr.onerror = () => {
+        reject(new ApiError(xhr.status || 0, "Network error during upload"));
+      };
+      xhr.onabort = () => reject(new ApiError(499, "Upload canceled"));
 
       xhr.onload = () => {
-        const payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+        let payload: unknown = null;
+        try {
+          payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+        } catch {
+          payload = null;
+        }
 
         if (xhr.status < 200 || xhr.status >= 300) {
-          const message = this.extractErrorMessage(payload);
+          const message = this.extractErrorMessage(
+            payload,
+            xhr.statusText?.trim() || `Upload failed (${xhr.status})`
+          );
 
           reject(new ApiError(xhr.status, message));
+          return;
+        }
+
+        if (payload === null && !xhr.responseText) {
+          reject(new ApiError(xhr.status, "Upload succeeded but response body was empty"));
           return;
         }
 
         resolve(payload as T);
       };
 
-      xhr.send(formData);
+      try {
+        xhr.send(formData);
+      } catch (err: any) {
+        reject(new ApiError(0, err?.message || "Failed to start upload request"));
+      }
     });
   }
 
@@ -151,23 +171,40 @@ class ApiClient {
         });
       };
 
-      request.onerror = () => reject(new ApiError(0, "Upload failed"));
+      request.onerror = () => reject(new ApiError(request.status || 0, "Network error during upload"));
       request.onabort = () => reject(new ApiError(499, "Upload canceled"));
 
       request.onload = () => {
-        const payload = request.responseText ? JSON.parse(request.responseText) : null;
+        let payload: unknown = null;
+        try {
+          payload = request.responseText ? JSON.parse(request.responseText) : null;
+        } catch {
+          payload = null;
+        }
 
         if (request.status < 200 || request.status >= 300) {
-          const message = this.extractErrorMessage(payload);
+          const message = this.extractErrorMessage(
+            payload,
+            request.statusText?.trim() || `Upload failed (${request.status})`
+          );
 
           reject(new ApiError(request.status, message));
+          return;
+        }
+
+        if (payload === null && !request.responseText) {
+          reject(new ApiError(request.status, "Upload succeeded but response body was empty"));
           return;
         }
 
         resolve(payload as T);
       };
 
-      request.send(file);
+      try {
+        request.send(file);
+      } catch (err: any) {
+        reject(new ApiError(0, err?.message || "Failed to start upload request"));
+      }
     });
 
     return {
@@ -463,6 +500,30 @@ class ApiClient {
       onProgress?: (progress: { loaded: number; total: number; percent: number }) => void
     ): Promise<{ success: boolean; filename: string }> => {
       return this.files.uploadCancelable(serverId, file, path, onProgress).promise;
+    },
+
+    uploadArchive: (
+      serverId: string,
+      archive: Blob,
+      path?: string,
+      onProgress?: (progress: { loaded: number; total: number; percent: number }) => void
+    ): Promise<{ success: boolean; extractedFiles: number }> => {
+      const formData = new FormData();
+      formData.append(
+        "file",
+        archive instanceof File ? archive : new File([archive], `folder-${Date.now()}.zip`, { type: "application/zip" })
+      );
+
+      const normalizedPath = this.normalizeOptionalPath(path);
+      if (normalizedPath) {
+        formData.append("path", normalizedPath);
+      }
+
+      return this.uploadFormDataWithProgress<{ success: boolean; extractedFiles: number }>(
+        `${API_BASE}/servers/${encodeURIComponent(serverId)}/files/upload-archive`,
+        formData,
+        onProgress
+      );
     },
 
     downloadAllUrl: (serverId: string) =>

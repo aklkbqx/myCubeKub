@@ -9,6 +9,7 @@ import { existsSync } from "fs";
 import { createWriteStream } from "fs";
 import { pipeline } from "stream/promises";
 import { Readable } from "stream";
+import { randomUUID } from "crypto";
 import { cacheService } from "../services/CacheService";
 import { CACHE_TTL, cacheKeys } from "../services/cacheKeys";
 import { MAX_UPLOAD_SIZE_BYTES } from "../utils/uploadLimits";
@@ -87,6 +88,50 @@ function parseNonNegativeInteger(value: string | null) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) return null;
   return parsed;
+}
+
+async function listZipEntries(zipPath: string) {
+  const proc = Bun.spawn(["unzip", "-Z1", zipPath], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const exitCode = await proc.exited;
+  const stdout = await new Response(proc.stdout).text();
+  if (exitCode !== 0) {
+    const stderr = await new Response(proc.stderr).text();
+    throw new Error(stderr.trim() || "Failed to inspect uploaded archive");
+  }
+
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function isUnsafeArchiveEntry(entry: string) {
+  if (!entry) return true;
+
+  const normalized = entry.replace(/\\/g, "/");
+  if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
+    return true;
+  }
+
+  const parts = normalized.split("/");
+  return parts.some((part) => part === "..");
+}
+
+async function unzipArchive(zipPath: string, targetDir: string) {
+  const proc = Bun.spawn(["unzip", "-oq", zipPath, "-d", targetDir], {
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    const stderr = await new Response(proc.stderr).text();
+    throw new Error(stderr.trim() || "Failed to extract uploaded archive");
+  }
 }
 
 const fileRoutes = new Elysia({ prefix: "/servers" })
@@ -421,6 +466,74 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
           success: t.Boolean(),
           filename: t.String(),
         }),
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+  .post(
+    "/:id/files/upload-archive",
+    async ({ params: { id }, body, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      const uploadDir = safePath(id, normalizeRelativePath(body.path));
+      const archiveFileName = `${Date.now()}-${randomUUID()}.zip`;
+      const tempArchivePath = join(uploadDir, `.${archiveFileName}`);
+
+      try {
+        if (!existsSync(uploadDir)) {
+          await mkdir(uploadDir, { recursive: true });
+        }
+
+        const file = body.file;
+        await Bun.write(tempArchivePath, file);
+
+        const entries = await listZipEntries(tempArchivePath);
+        if (entries.length === 0) {
+          set.status = 400;
+          return { error: "Uploaded archive is empty" };
+        }
+
+        const unsafeEntry = entries.find(isUnsafeArchiveEntry);
+        if (unsafeEntry) {
+          set.status = 400;
+          return { error: `Unsafe archive entry detected: ${unsafeEntry}` };
+        }
+
+        await unzipArchive(tempArchivePath, uploadDir);
+        await invalidateFileCache(id);
+
+        const extractedFiles = entries.filter((entry) => !entry.endsWith("/")).length;
+        return { success: true, extractedFiles };
+      } catch (err: any) {
+        set.status = 500;
+        return { error: err.message || "Failed to upload archive" };
+      } finally {
+        await rm(tempArchivePath, { force: true });
+      }
+    },
+    {
+      params: t.Object({ id: t.String() }),
+      body: t.Object({
+        file: t.File({ maxSize: MAX_UPLOAD_SIZE_BYTES }),
+        path: t.Optional(t.String()),
+      }),
+      response: {
+        200: t.Object({
+          success: t.Boolean(),
+          extractedFiles: t.Number(),
+        }),
+        400: errorResponse,
         401: errorResponse,
         404: errorResponse,
         500: errorResponse,
