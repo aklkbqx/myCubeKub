@@ -660,14 +660,17 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
       try {
         const normalizedPath = normalizeRelativePath(query.path);
         const filePath = safePath(id, normalizedPath);
-        const file = Bun.file(filePath);
-
-        if (!await file.exists()) {
-          set.status = 404;
-          return { error: "File not found" };
+        let targetStats;
+        try {
+          targetStats = await stat(filePath);
+        } catch (err: any) {
+          if (err?.code === "ENOENT") {
+            set.status = 404;
+            return { error: "File not found" };
+          }
+          throw err;
         }
 
-        const targetStats = await stat(filePath);
         if (targetStats.isDirectory()) {
           const archiveName = toPathArchiveFilename(normalizedPath);
           const proc = Bun.spawn(["tar", "-czf", "-", "."], {
@@ -687,6 +690,7 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
           });
         }
 
+        const file = Bun.file(filePath);
         set.headers["content-disposition"] = `attachment; filename="${basename(normalizedPath)}"`;
         return file;
       } catch (err: any) {

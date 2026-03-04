@@ -25,6 +25,18 @@ const treaty = edenTreaty<App>(API_BASE, {
 });
 
 class ApiClient {
+  private extractErrorMessage(payload: unknown, fallback = "Request failed") {
+    if (payload && typeof payload === "object") {
+      if ("error" in payload && typeof (payload as { error?: unknown }).error === "string") {
+        return (payload as { error: string }).error;
+      }
+      if ("message" in payload && typeof (payload as { message?: unknown }).message === "string") {
+        return (payload as { message: string }).message;
+      }
+    }
+    return fallback;
+  }
+
   private normalizeOptionalPath(path?: string) {
     if (!path || path === "undefined" || path === "null") {
       return undefined;
@@ -48,13 +60,7 @@ class ApiClient {
     const { data, error, status } = await request;
 
     if (error) {
-      const message =
-        typeof error.value === "object" &&
-          error.value !== null &&
-          "error" in error.value &&
-          typeof error.value.error === "string"
-          ? error.value.error
-          : "Request failed";
+      const message = this.extractErrorMessage(error.value);
 
       throw new ApiError(status, message);
     }
@@ -71,13 +77,7 @@ class ApiClient {
     const payload = await response.json().catch(() => null);
 
     if (!response.ok) {
-      const message =
-        payload &&
-        typeof payload === "object" &&
-        "error" in payload &&
-        typeof payload.error === "string"
-          ? payload.error
-          : "Request failed";
+      const message = this.extractErrorMessage(payload);
 
       throw new ApiError(response.status, message);
     }
@@ -111,13 +111,7 @@ class ApiClient {
         const payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
 
         if (xhr.status < 200 || xhr.status >= 300) {
-          const message =
-            payload &&
-            typeof payload === "object" &&
-            "error" in payload &&
-            typeof payload.error === "string"
-              ? payload.error
-              : "Request failed";
+          const message = this.extractErrorMessage(payload);
 
           reject(new ApiError(xhr.status, message));
           return;
@@ -164,13 +158,7 @@ class ApiClient {
         const payload = request.responseText ? JSON.parse(request.responseText) : null;
 
         if (request.status < 200 || request.status >= 300) {
-          const message =
-            payload &&
-            typeof payload === "object" &&
-            "error" in payload &&
-            typeof payload.error === "string"
-              ? payload.error
-              : "Request failed";
+          const message = this.extractErrorMessage(payload);
 
           reject(new ApiError(request.status, message));
           return;

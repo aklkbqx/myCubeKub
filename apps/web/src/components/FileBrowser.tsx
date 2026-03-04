@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback, useRef, type ReactNode, type ChangeEvent, type DragEvent } from "react";
 import { createPortal } from "react-dom";
-import { api, type FileInfo } from "@/lib/api";
+import { ApiError, api, type FileInfo } from "@/lib/api";
 import { formatBytes } from "@/lib/utils";
 import {
     Folder, File, ArrowLeft, Trash2, Download, Upload,
-    FolderPlus, Edit3, X, Check, Inbox, HardDriveDownload, Search, ArrowUpDown,
+    FolderPlus, Edit3, X, Check, Inbox, HardDriveDownload, Search, ArrowUpDown, FolderUp, Folders,
 } from "lucide-react";
 import { LoadingOverlay } from "./LoadingOverlay";
 import SelectDropdown from "./SelectDropdown";
@@ -27,6 +27,39 @@ type UploadState = {
     percent: number;
 };
 
+type UploadCandidate = {
+    file: File;
+    relativeDir?: string;
+};
+
+type SkippedCollectionItem = {
+    path?: string;
+    reason: string;
+};
+
+type DropCollectionStat = {
+    expected: number;
+    fromEntries: number;
+    fromFileList: number;
+    merged: number;
+    skipped: SkippedCollectionItem[];
+};
+
+type DropCollectionResult = {
+    candidates: UploadCandidate[];
+    directories: string[];
+    stats: DropCollectionStat;
+};
+
+type UploadSummary = {
+    expected: number;
+    prepared: number;
+    uploaded: number;
+    failed: number;
+    missingBeforeUpload: number;
+    skippedDuringCollection: SkippedCollectionItem[];
+};
+
 interface IconTooltipProps {
     label: string;
     children: ReactNode;
@@ -45,6 +78,272 @@ function IconTooltip({ label, children }: IconTooltipProps) {
 
 function joinRelativePath(basePath: string, name: string) {
     return basePath ? `${basePath}/${name}` : name;
+}
+
+function normalizeJoinPath(basePath: string, extraPath: string) {
+    if (!basePath) return extraPath;
+    if (!extraPath) return basePath;
+    return `${basePath}/${extraPath}`;
+}
+
+function sanitizeRelativePath(path: string) {
+    const normalized = path.replace(/\\/g, "/");
+    const segments = normalized.split("/");
+    const safe: string[] = [];
+    for (const segment of segments) {
+        if (!segment || segment === ".") continue;
+        if (segment === "..") {
+            safe.pop();
+            continue;
+        }
+        safe.push(segment);
+    }
+    return safe.join("/");
+}
+
+function getFileRelativeDirectory(file: File) {
+    const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || "";
+    if (!relativePath.includes("/")) return "";
+    const parentPath = relativePath.split("/").slice(0, -1).join("/");
+    return sanitizeRelativePath(parentPath);
+}
+
+const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+function toPathSegments(path: string) {
+    return path.split("/").filter(Boolean);
+}
+
+function normalizeRelativeDir(path: string) {
+    return sanitizeRelativePath(toPathSegments(path).join("/"));
+}
+
+async function collectDropCandidates(
+    event: DragEvent<HTMLDivElement>
+): Promise<DropCollectionResult> {
+    const items = Array.from(event.dataTransfer.items || []);
+    const supportsEntries = items.some((item) => typeof (item as any).webkitGetAsEntry === "function");
+    const fromFileList = Array.from(event.dataTransfer.files || []).map((file) => ({
+        file,
+        relativeDir: getFileRelativeDirectory(file),
+    }));
+    const skipped: SkippedCollectionItem[] = [];
+
+    const collectedFromEntries: UploadCandidate[] = [];
+    const discoveredDirectories = new Set<string>();
+
+    const readDirectoryEntries = async (reader: any): Promise<any[]> => {
+        const entries: any[] = [];
+        let exhausted = false;
+        while (true) {
+            const chunk = await Promise.race([
+                new Promise<any[]>((resolve) => {
+                    reader.readEntries((batch: any[]) => resolve(batch || []), () => resolve([]));
+                }),
+                new Promise<any[]>((resolve) => {
+                    window.setTimeout(() => {
+                        exhausted = true;
+                        resolve([]);
+                    }, 2500);
+                }),
+            ]);
+            if (exhausted) {
+                break;
+            }
+            if (!chunk.length) {
+                break;
+            }
+            for (const entry of chunk) {
+                entries.push(entry);
+            }
+        }
+        return entries;
+    };
+
+    const readFileFromEntry = async (entry: any): Promise<File | null> => {
+        return new Promise<File | null>((resolve) => {
+            try {
+                entry.file(
+                    (file: File) => resolve(file),
+                    () => resolve(null)
+                );
+            } catch {
+                resolve(null);
+            }
+        });
+    };
+
+    const traverseEntry = async (entry: any, parentDir: string) => {
+        if (!entry) return;
+
+        const safeParentDir = normalizeRelativeDir(parentDir);
+
+        if (entry.isFile) {
+            const file = await readFileFromEntry(entry);
+            const filePath = normalizeJoinPath(safeParentDir, entry.name || "");
+            if (!file) {
+                skipped.push({
+                    path: sanitizeRelativePath(filePath),
+                    reason: "Unable to read dropped file from DataTransfer entry",
+                });
+                return;
+            }
+
+            collectedFromEntries.push({
+                file,
+                relativeDir: safeParentDir,
+            });
+            return;
+        }
+
+        if (!entry.isDirectory) {
+            skipped.push({
+                path: sanitizeRelativePath(normalizeJoinPath(safeParentDir, entry.name || "")),
+                reason: "Unsupported dropped item type",
+            });
+            return;
+        }
+
+        try {
+            const nextParent = normalizeRelativeDir(normalizeJoinPath(safeParentDir, entry.name || ""));
+            if (nextParent) {
+                discoveredDirectories.add(nextParent);
+            }
+            const reader = entry.createReader();
+            const children = await readDirectoryEntries(reader);
+            if (children.length === 0) {
+                return;
+            }
+            for (const child of children) {
+                await traverseEntry(child, nextParent);
+            }
+        } catch {
+            skipped.push({
+                path: sanitizeRelativePath(normalizeJoinPath(safeParentDir, entry.name || "")),
+                reason: "Failed to traverse dropped directory",
+            });
+        }
+    };
+
+    if (supportsEntries) {
+        for (const item of items) {
+            const entry = (item as any).webkitGetAsEntry?.();
+            if (!entry) continue;
+            await traverseEntry(entry, "");
+        }
+    }
+
+    const mergedByKey = new Map<string, UploadCandidate>();
+    const looseFingerprints = new Map<string, string>();
+    const allCandidates = [...collectedFromEntries, ...fromFileList];
+
+    for (const candidate of allCandidates) {
+        const relativeDir = normalizeRelativeDir(candidate.relativeDir || "");
+        const normalizedCandidate: UploadCandidate = { file: candidate.file, relativeDir };
+        const fullKey = uploadCandidateKey(normalizedCandidate);
+        const looseKey = `${normalizedCandidate.file.name}:${normalizedCandidate.file.size}:${normalizedCandidate.file.lastModified}`;
+        const existingFull = mergedByKey.get(fullKey);
+        if (existingFull) {
+            continue;
+        }
+
+        const preferredKey = looseFingerprints.get(looseKey);
+        if (preferredKey) {
+            const existingPreferred = mergedByKey.get(preferredKey);
+            if (existingPreferred && !existingPreferred.relativeDir && relativeDir) {
+                mergedByKey.delete(preferredKey);
+                mergedByKey.set(fullKey, normalizedCandidate);
+                looseFingerprints.set(looseKey, fullKey);
+            } else if (existingPreferred && existingPreferred.relativeDir && !relativeDir) {
+                continue;
+            } else {
+                mergedByKey.set(fullKey, normalizedCandidate);
+            }
+            continue;
+        }
+
+        mergedByKey.set(fullKey, normalizedCandidate);
+        looseFingerprints.set(looseKey, fullKey);
+    }
+
+    const result: DropCollectionResult = {
+        candidates: Array.from(mergedByKey.values()),
+        directories: Array.from(discoveredDirectories),
+        stats: {
+            expected: event.dataTransfer.files?.length ?? 0,
+            fromEntries: collectedFromEntries.length,
+            fromFileList: fromFileList.length,
+            merged: mergedByKey.size,
+            skipped,
+        },
+    };
+
+    if (import.meta.env.DEV) {
+        console.info("[FileBrowser] Drop collection summary", {
+            expected: result.stats.expected,
+            fromEntries: result.stats.fromEntries,
+            fromFileList: result.stats.fromFileList,
+            merged: result.stats.merged,
+            discoveredDirectories: result.directories.length,
+            skippedCount: result.stats.skipped.length,
+            skippedPreview: result.stats.skipped.slice(0, 10),
+        });
+    }
+
+    return result;
+}
+
+function getDownloadFilename(contentDisposition: string | null, fallbackName: string) {
+    if (!contentDisposition) return fallbackName;
+
+    const filenameStarMatch = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+    if (filenameStarMatch?.[1]) {
+        try {
+            return decodeURIComponent(filenameStarMatch[1].trim().replace(/^"|"$/g, ""));
+        } catch {
+            // Ignore malformed filename and fallback below.
+        }
+    }
+
+    const filenameMatch = contentDisposition.match(/filename\s*=\s*("?)([^";]+)\1/i);
+    if (filenameMatch?.[2]) {
+        return filenameMatch[2].trim();
+    }
+
+    return fallbackName;
+}
+
+function collectPathWithAncestors(path: string) {
+    const segments = path.split("/").filter(Boolean);
+    const paths: string[] = [];
+    for (let i = 1; i <= segments.length; i += 1) {
+        paths.push(segments.slice(0, i).join("/"));
+    }
+    return paths;
+}
+
+function toUploadCandidates(fileList: FileList | File[]) {
+    return Array.from(fileList).map((file) => ({
+        file,
+        relativeDir: getFileRelativeDirectory(file),
+    }));
+}
+
+function collectDirectoriesFromCandidates(candidates: UploadCandidate[]) {
+    const directories = new Set<string>();
+    for (const candidate of candidates) {
+        const relativeDir = normalizeRelativeDir(candidate.relativeDir || "");
+        if (!relativeDir) continue;
+        const segments = relativeDir.split("/").filter(Boolean);
+        for (let i = 1; i <= segments.length; i += 1) {
+            directories.add(segments.slice(0, i).join("/"));
+        }
+    }
+    return Array.from(directories);
+}
+
+function uploadCandidateKey(candidate: UploadCandidate) {
+    return `${normalizeRelativeDir(candidate.relativeDir || "")}/${candidate.file.name}:${candidate.file.size}:${candidate.file.lastModified}`;
 }
 
 type FileFilterMode = "all" | "files" | "folders";
@@ -85,10 +384,15 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
     const [filterMode, setFilterMode] = useState<FileFilterMode>("all");
     const [sortMode, setSortMode] = useState<FileSortMode>("name-asc");
     const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+    const [queuedFolderCandidates, setQueuedFolderCandidates] = useState<UploadCandidate[]>([]);
+    const [collectionWarning, setCollectionWarning] = useState("");
+    const [lastUploadSummary, setLastUploadSummary] = useState<UploadSummary | null>(null);
     const [deleteConfirm, setDeleteConfirm] = useState<FileDeleteConfirmState | null>(null);
     const [previewImage, setPreviewImage] = useState<FileInfo | null>(null);
     const dragDepthRef = useRef(0);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const folderInputRef = useRef<HTMLInputElement | null>(null);
+    const batchFolderInputRef = useRef<HTMLInputElement | null>(null);
     const recentUploadTimeoutRef = useRef<number | null>(null);
     const uploadCancelRef = useRef<(() => void) | null>(null);
     const uploadCanceledRef = useRef(false);
@@ -202,76 +506,191 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         }
     };
 
-    const uploadFiles = useCallback(async (fileList: FileList | File[], targetPath?: string) => {
-        const items = Array.from(fileList);
-        if (items.length === 0) return;
-        const destinationPath = targetPath ?? normalizedCurrentPath;
+    const uploadFiles = useCallback(async (
+        input: FileList | File[] | UploadCandidate[],
+        targetPath?: string,
+        options?: {
+            preserveRelativeDirectories?: boolean;
+            expectedFiles?: number;
+            skippedDuringCollection?: SkippedCollectionItem[];
+            directoriesToEnsure?: string[];
+        }
+    ) => {
+        const candidates: UploadCandidate[] = Array.isArray(input)
+            ? (input.length > 0 && "file" in input[0]
+                ? (input as UploadCandidate[])
+                : (input as File[]).map((file) => ({ file })))
+            : Array.from(input).map((file) => ({ file }));
+        if (candidates.length === 0) return;
+
+        const basePath = targetPath ?? normalizedCurrentPath;
+        const uploadItems = candidates.map((candidate) => {
+            const relativeDir = options?.preserveRelativeDirectories
+                ? (candidate.relativeDir || getFileRelativeDirectory(candidate.file))
+                : "";
+            const destinationPath = normalizeJoinPath(basePath, relativeDir);
+            const uploadPath = joinRelativePath(destinationPath, candidate.file.name);
+            return {
+                file: candidate.file,
+                destinationPath,
+                uploadPath,
+            };
+        });
+        const firstPath = uploadItems[0]?.destinationPath || basePath;
 
         setUploading(true);
         uploadCanceledRef.current = false;
         setError("");
+        setCollectionWarning("");
+        setLastUploadSummary(null);
         setFolderDropTarget(null);
         setUploadState({
-            targetPath: destinationPath || "data",
-            totalFiles: items.length,
+            targetPath: firstPath || "data",
+            totalFiles: uploadItems.length,
             completedFiles: 0,
-            currentFileName: items[0]?.name || "",
+            currentFileName: uploadItems[0]?.file.name || "",
             percent: 0,
         });
 
-        try {
-            for (let index = 0; index < items.length; index += 1) {
-                const file = items[index];
-                const uploadTask = api.files.uploadCancelable(serverId, file, destinationPath || undefined, (progress) => {
-                    const overallPercent = Math.round(((index + progress.percent / 100) / items.length) * 100);
+        const expectedFiles = options?.expectedFiles ?? uploadItems.length;
+        const skippedDuringCollection = options?.skippedDuringCollection || [];
+        const candidateDirectories = options?.preserveRelativeDirectories
+            ? collectDirectoriesFromCandidates(candidates)
+            : [];
+        const directoriesToEnsure = Array.from(new Set([
+            ...(options?.directoriesToEnsure || []),
+            ...candidateDirectories,
+        ]));
+        const successfulUploadPaths: string[] = [];
+        let failedCount = 0;
+        let completedCount = 0;
+
+        if (directoriesToEnsure.length > 0) {
+            for (const relativeDir of directoriesToEnsure) {
+                const targetDir = normalizeJoinPath(basePath, relativeDir);
+                try {
+                    await api.files.mkdir(serverId, targetDir);
+                } catch (err: any) {
+                    if (uploadCanceledRef.current) break;
+                    failedCount += 1;
+                    setError(err?.message || `Failed to prepare folder "${targetDir}"`);
+                }
+            }
+        }
+
+        for (let index = 0; index < uploadItems.length; index += 1) {
+            if (uploadCanceledRef.current) break;
+
+            const item = uploadItems[index];
+            let completed = false;
+            let attempt = 0;
+
+            while (!completed) {
+                const uploadTask = api.files.uploadCancelable(serverId, item.file, item.destinationPath || undefined, (progress) => {
+                    const overallPercent = Math.round(((index + progress.percent / 100) / uploadItems.length) * 100);
                     setUploadState({
-                        targetPath: destinationPath || "data",
-                        totalFiles: items.length,
-                        completedFiles: index,
-                        currentFileName: file.name,
+                        targetPath: item.destinationPath || "data",
+                        totalFiles: uploadItems.length,
+                        completedFiles: completedCount,
+                        currentFileName: item.file.name,
                         percent: overallPercent,
                     });
                 });
                 uploadCancelRef.current = uploadTask.cancel;
-                await uploadTask.promise;
-                uploadCancelRef.current = null;
 
+                try {
+                    await uploadTask.promise;
+                    completed = true;
+                } catch (err: any) {
+                    if (uploadCanceledRef.current) {
+                        break;
+                    }
+                    const isRateLimited = err instanceof ApiError && err.status === 429;
+                    if (isRateLimited && attempt < 3) {
+                        attempt += 1;
+                        const retryDelayMs = 1000 * attempt;
+                        setError(`Rate limit reached, retrying "${item.file.name}" (${attempt}/3)...`);
+                        await wait(retryDelayMs);
+                        continue;
+                    }
+
+                    failedCount += 1;
+                    setError(err?.message || `Failed to upload ${item.file.name}`);
+                    break;
+                } finally {
+                    uploadCancelRef.current = null;
+                }
+            }
+
+            if (completed) {
+                completedCount += 1;
+                successfulUploadPaths.push(item.uploadPath);
                 setUploadState({
-                    targetPath: destinationPath || "data",
-                    totalFiles: items.length,
-                    completedFiles: index + 1,
-                    currentFileName: file.name,
-                    percent: Math.round(((index + 1) / items.length) * 100),
+                    targetPath: item.destinationPath || "data",
+                    totalFiles: uploadItems.length,
+                    completedFiles: completedCount,
+                    currentFileName: item.file.name,
+                    percent: Math.round(((index + 1) / uploadItems.length) * 100),
                 });
             }
+        }
 
-            if (destinationPath === normalizedCurrentPath) {
-                const uploadedPaths = items.map((file) => joinRelativePath(destinationPath, file.name));
-                setRecentlyUploadedPaths(uploadedPaths);
-                if (recentUploadTimeoutRef.current) {
-                    window.clearTimeout(recentUploadTimeoutRef.current);
-                }
-                recentUploadTimeoutRef.current = window.setTimeout(() => {
-                    setRecentlyUploadedPaths([]);
-                    recentUploadTimeoutRef.current = null;
-                }, 8000);
+        if (basePath === normalizedCurrentPath && successfulUploadPaths.length > 0) {
+            const uploadedPaths = Array.from(
+                new Set(successfulUploadPaths.flatMap((path) => collectPathWithAncestors(path)))
+            );
+            setRecentlyUploadedPaths(uploadedPaths);
+            if (recentUploadTimeoutRef.current) {
+                window.clearTimeout(recentUploadTimeoutRef.current);
             }
+            recentUploadTimeoutRef.current = window.setTimeout(() => {
+                setRecentlyUploadedPaths([]);
+                recentUploadTimeoutRef.current = null;
+            }, 8000);
+        }
 
+        if (!uploadCanceledRef.current) {
             onServerFilesChanged?.();
             await fetchFiles();
-        } catch (err: any) {
-            if (uploadCanceledRef.current) {
-                setError("Upload canceled.");
-            } else {
-                setError(err.message || "Failed to upload file.");
-            }
-        } finally {
-            uploadCancelRef.current = null;
-            uploadCanceledRef.current = false;
-            setUploading(false);
-            setUploadState(null);
         }
-    }, [normalizedCurrentPath, fetchFiles, serverId]);
+
+        const uploaded = Math.max(uploadItems.length - failedCount, 0);
+        const missingBeforeUpload = Math.max(expectedFiles - uploadItems.length, 0);
+        setLastUploadSummary({
+            expected: expectedFiles,
+            prepared: uploadItems.length,
+            uploaded,
+            failed: failedCount,
+            missingBeforeUpload,
+            skippedDuringCollection,
+        });
+        if (import.meta.env.DEV) {
+            console.info("[FileBrowser] Upload summary", {
+                expected: expectedFiles,
+                prepared: uploadItems.length,
+                uploaded,
+                failed: failedCount,
+                missingBeforeUpload,
+                skippedDuringCollectionCount: skippedDuringCollection.length,
+                skippedDuringCollectionPreview: skippedDuringCollection.slice(0, 10),
+            });
+        }
+
+        if (uploadCanceledRef.current) {
+            setError("Upload canceled.");
+        } else if (failedCount > 0) {
+            setError(`Upload completed with ${failedCount} failed file${failedCount > 1 ? "s" : ""}.`);
+        } else if (skippedDuringCollection.length > 0 || missingBeforeUpload > 0) {
+            setCollectionWarning("Upload finished for readable files only. Some dropped files were skipped before upload.");
+        } else {
+            setError("");
+        }
+
+        uploadCancelRef.current = null;
+        uploadCanceledRef.current = false;
+        setUploading(false);
+        setUploadState(null);
+    }, [normalizedCurrentPath, fetchFiles, serverId, onServerFilesChanged]);
 
     const handleCancelUpload = () => {
         if (!uploading) return;
@@ -283,10 +702,19 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         fileInputRef.current?.click();
     };
 
+    const handleUploadFolder = async () => {
+        folderInputRef.current?.click();
+    };
+
+    const handleQueueFolders = async () => {
+        batchFolderInputRef.current?.click();
+    };
+
     const handleFileSelection = async (e: ChangeEvent<HTMLInputElement>) => {
         const selectedFiles = e.target.files;
         if (!selectedFiles?.length) return;
 
+        setCollectionWarning("");
         await uploadFiles(selectedFiles);
         e.target.value = "";
     };
@@ -323,9 +751,28 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         setFolderDropTarget(null);
 
         const droppedFiles = e.dataTransfer.files;
-        if (!droppedFiles?.length) return;
+        if (!droppedFiles?.length && !(e.dataTransfer.items?.length)) return;
 
-        await uploadFiles(droppedFiles);
+        const { candidates, directories, stats } = await collectDropCandidates(e);
+        if (!candidates.length) {
+            setCollectionWarning("No readable files were found in the dropped folder.");
+            return;
+        }
+
+        if (stats.merged < stats.expected) {
+            const missing = stats.expected - stats.merged;
+            setCollectionWarning(`Detected ${missing} dropped file${missing > 1 ? "s" : ""} missing before upload. Uploading readable files.`);
+        } else {
+            setCollectionWarning("");
+        }
+
+        const shouldPreserveRelativeDirectories = candidates.some((item) => Boolean(item.relativeDir));
+        await uploadFiles(candidates, undefined, {
+            preserveRelativeDirectories: shouldPreserveRelativeDirectories,
+            expectedFiles: stats.expected,
+            skippedDuringCollection: stats.skipped,
+            directoriesToEnsure: directories,
+        });
     };
 
     const handleFolderDrop = async (e: DragEvent<HTMLDivElement>, folderPath: string) => {
@@ -336,9 +783,75 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         setFolderDropTarget(null);
 
         const droppedFiles = e.dataTransfer.files;
-        if (!droppedFiles?.length) return;
+        if (!droppedFiles?.length && !(e.dataTransfer.items?.length)) return;
 
-        await uploadFiles(droppedFiles, folderPath);
+        const { candidates, directories, stats } = await collectDropCandidates(e);
+        if (!candidates.length) {
+            setCollectionWarning("No readable files were found in the dropped folder.");
+            return;
+        }
+
+        if (stats.merged < stats.expected) {
+            const missing = stats.expected - stats.merged;
+            setCollectionWarning(`Detected ${missing} dropped file${missing > 1 ? "s" : ""} missing before upload. Uploading readable files.`);
+        } else {
+            setCollectionWarning("");
+        }
+
+        const shouldPreserveRelativeDirectories = candidates.some((item) => Boolean(item.relativeDir));
+        await uploadFiles(candidates, folderPath, {
+            preserveRelativeDirectories: shouldPreserveRelativeDirectories,
+            expectedFiles: stats.expected,
+            skippedDuringCollection: stats.skipped,
+            directoriesToEnsure: directories,
+        });
+    };
+
+    const handleFolderSelection = async (e: ChangeEvent<HTMLInputElement>) => {
+        const selectedFiles = e.target.files;
+        if (!selectedFiles?.length) return;
+
+        const files = Array.from(selectedFiles);
+        const emptyRelativeCount = files.filter((file) => !getFileRelativeDirectory(file)).length;
+        if (files.length >= 5 && emptyRelativeCount / files.length > 0.35) {
+            setCollectionWarning("Many selected files have missing relative paths. Folder structure may be flattened.");
+        } else {
+            setCollectionWarning("");
+        }
+
+        await uploadFiles(selectedFiles, undefined, {
+            preserveRelativeDirectories: true,
+            expectedFiles: files.length,
+        });
+        e.target.value = "";
+    };
+
+    const handleBatchFolderSelection = (e: ChangeEvent<HTMLInputElement>) => {
+        const selectedFiles = e.target.files;
+        if (!selectedFiles?.length) return;
+
+        const added = toUploadCandidates(selectedFiles);
+        setQueuedFolderCandidates((prev) => {
+            const seen = new Set(prev.map(uploadCandidateKey));
+            const merged = [...prev];
+            for (const candidate of added) {
+                const key = uploadCandidateKey(candidate);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                merged.push(candidate);
+            }
+            return merged;
+        });
+        e.target.value = "";
+    };
+
+    const handleUploadQueuedFolders = async () => {
+        if (queuedFolderCandidates.length === 0) return;
+        await uploadFiles(queuedFolderCandidates, undefined, {
+            preserveRelativeDirectories: true,
+            expectedFiles: queuedFolderCandidates.length,
+        });
+        setQueuedFolderCandidates([]);
     };
 
     const handleFileClick = (file: FileInfo) => {
@@ -400,15 +913,54 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         setSelectedPaths(allFilesSelected ? [] : selectableItems.map((file) => file.path));
     };
 
-    const triggerDownload = (path: string) => {
+    const downloadFromUrl = useCallback(async (url: string, fallbackName: string) => {
+        const response = await fetch(url, { credentials: "include" });
+        const responseContentType = response.headers.get("content-type") || "";
+
+        if (!response.ok) {
+            const payload = await response.json().catch(() => null);
+            const message =
+                payload &&
+                    typeof payload === "object" &&
+                    "error" in payload &&
+                    typeof payload.error === "string"
+                    ? payload.error
+                    : "Download failed.";
+            throw new Error(message);
+        }
+
+        if (responseContentType.includes("application/json")) {
+            const payload = await response.json().catch(() => null);
+            const message =
+                payload &&
+                    typeof payload === "object" &&
+                    "error" in payload &&
+                    typeof payload.error === "string"
+                    ? payload.error
+                    : "Unexpected JSON response while downloading file.";
+            throw new Error(message);
+        }
+
+        const filename = getDownloadFilename(
+            response.headers.get("content-disposition"),
+            fallbackName
+        );
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
         const anchor = document.createElement("a");
-        anchor.href = api.files.downloadUrl(serverId, path);
-        anchor.download = path.split("/").pop() || "download";
+        anchor.href = objectUrl;
+        anchor.download = filename;
         anchor.rel = "noopener";
         document.body.appendChild(anchor);
         anchor.click();
         anchor.remove();
-    };
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
+    }, []);
+
+    const triggerDownload = useCallback(async (path: string) => {
+        const fallbackName = path.split("/").pop() || "download";
+        await downloadFromUrl(api.files.downloadUrl(serverId, path), fallbackName);
+    }, [downloadFromUrl, serverId]);
 
     const handleDownloadSelected = async () => {
         if (visibleSelectedItems.length === 0) return;
@@ -418,7 +970,7 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
 
         try {
             for (const file of visibleSelectedItems) {
-                triggerDownload(file.path);
+                await triggerDownload(file.path);
                 await new Promise((resolve) => setTimeout(resolve, 150));
             }
         } catch (err: any) {
@@ -466,14 +1018,16 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         await executeDeleteSelected(confirmState.items);
     };
 
-    const handleDownloadAll = () => {
-        const anchor = document.createElement("a");
-        anchor.href = api.files.downloadAllUrl(serverId);
-        anchor.download = "server-data.tar.gz";
-        anchor.rel = "noopener";
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
+    const handleDownloadAll = async () => {
+        setDownloading(true);
+        setError("");
+        try {
+            await downloadFromUrl(api.files.downloadAllUrl(serverId), "server-data.tar.gz");
+        } catch (err: any) {
+            setError(err.message || "Failed to download data folder.");
+        } finally {
+            setDownloading(false);
+        }
     };
 
     const breadcrumbs = normalizedCurrentPath ? normalizedCurrentPath.split("/").filter(Boolean) : [];
@@ -525,9 +1079,100 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                 className="hidden"
                 onChange={handleFileSelection}
             />
+            <input
+                ref={folderInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={handleFolderSelection}
+                {...({ webkitdirectory: "", directory: "" } as any)}
+            />
+            <input
+                ref={batchFolderInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={handleBatchFolderSelection}
+                {...({ webkitdirectory: "", directory: "" } as any)}
+            />
             {error && (
                 <div className="mb-4 rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-300">
                     {error}
+                </div>
+            )}
+            {collectionWarning && (
+                <div className="mb-4 rounded-lg border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+                    {collectionWarning}
+                </div>
+            )}
+            {lastUploadSummary && (
+                <div className="mb-4 rounded-2xl border border-surface-700/70 bg-surface-900/55 px-4 py-3 text-xs text-surface-300">
+                    <div className="flex flex-wrap items-center gap-2">
+                        <span className="rounded-full border border-surface-700/70 bg-surface-900 px-2.5 py-1">
+                            Expected: {lastUploadSummary.expected}
+                        </span>
+                        <span className="rounded-full border border-surface-700/70 bg-surface-900 px-2.5 py-1">
+                            Prepared: {lastUploadSummary.prepared}
+                        </span>
+                        <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-emerald-200">
+                            Uploaded: {lastUploadSummary.uploaded}
+                        </span>
+                        <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-red-200">
+                            Failed: {lastUploadSummary.failed}
+                        </span>
+                        <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-amber-200">
+                            Skipped during collection: {lastUploadSummary.skippedDuringCollection.length}
+                        </span>
+                    </div>
+                    {(lastUploadSummary.missingBeforeUpload > 0 || lastUploadSummary.skippedDuringCollection.length > 0) && (
+                        <div className="mt-2 space-y-1 text-amber-200">
+                            {lastUploadSummary.missingBeforeUpload > 0 && (
+                                <p>
+                                    Missing before upload: {lastUploadSummary.missingBeforeUpload} file{lastUploadSummary.missingBeforeUpload > 1 ? "s" : ""}.
+                                </p>
+                            )}
+                            {lastUploadSummary.skippedDuringCollection.length > 0 && (
+                                <>
+                                    <p>Skipped items preview:</p>
+                                    <ul className="list-disc space-y-0.5 pl-4 text-amber-100">
+                                        {lastUploadSummary.skippedDuringCollection.slice(0, 10).map((item, idx) => (
+                                            <li key={`${item.path || "unknown"}-${idx}`}>
+                                                {item.path || "(unknown path)"} - {item.reason}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                    {lastUploadSummary.skippedDuringCollection.length > 10 && (
+                                        <p>
+                                            ...and {lastUploadSummary.skippedDuringCollection.length - 10} more skipped items.
+                                        </p>
+                                    )}
+                                </>
+                            )}
+                        </div>
+                    )}
+                </div>
+            )}
+            {queuedFolderCandidates.length > 0 && (
+                <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-brand-500/20 bg-brand-500/10 px-4 py-3 text-xs text-surface-200">
+                    <span className="rounded-full border border-brand-500/30 bg-brand-500/15 px-2.5 py-1 font-medium text-brand-200">
+                        {queuedFolderCandidates.length} files queued from folders
+                    </span>
+                    <button
+                        type="button"
+                        onClick={() => void handleUploadQueuedFolders()}
+                        disabled={uploading}
+                        className="rounded-lg border border-brand-500/30 bg-brand-500/15 px-2.5 py-1 font-medium text-brand-100 transition-colors hover:bg-brand-500/20 disabled:opacity-50"
+                    >
+                        Upload queued folders
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setQueuedFolderCandidates([])}
+                        disabled={uploading}
+                        className="rounded-lg border border-surface-700/70 bg-surface-900/60 px-2.5 py-1 text-surface-300 transition-colors hover:bg-surface-800 disabled:opacity-50"
+                    >
+                        Clear queue
+                    </button>
                 </div>
             )}
             {uploadState && (
@@ -604,6 +1249,24 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                             aria-label="Upload files"
                         >
                             <Upload size={16} />
+                        </button>
+                    </IconTooltip>
+                    <IconTooltip label="Upload folder">
+                        <button
+                            onClick={handleUploadFolder}
+                            className="btn-icon text-surface-400 hover:text-surface-200"
+                            aria-label="Upload folder"
+                        >
+                            <FolderUp size={16} />
+                        </button>
+                    </IconTooltip>
+                    <IconTooltip label="Queue folders">
+                        <button
+                            onClick={handleQueueFolders}
+                            className="btn-icon text-surface-400 hover:text-surface-200"
+                            aria-label="Queue folders"
+                        >
+                            <Folders size={16} />
                         </button>
                     </IconTooltip>
                     <IconTooltip label="Create folder">
@@ -939,14 +1602,25 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                                         )}
                                         {!file.isDirectory && (
                                             <IconTooltip label="Download">
-                                                <a
-                                                    href={api.files.downloadUrl(serverId, file.path)}
+                                                <button
+                                                    type="button"
                                                     className="btn-icon text-surface-500 hover:text-surface-300 p-1"
                                                     aria-label={`Download ${file.name}`}
-                                                    onClick={(e) => e.stopPropagation()}
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        setError("");
+                                                        setDownloading(true);
+                                                        void triggerDownload(file.path)
+                                                            .catch((err: any) => {
+                                                                setError(err.message || "Failed to download file.");
+                                                            })
+                                                            .finally(() => {
+                                                                setDownloading(false);
+                                                            });
+                                                    }}
                                                 >
                                                     <Download size={12} />
-                                                </a>
+                                                </button>
                                             </IconTooltip>
                                         )}
                                         <IconTooltip label="Delete">
