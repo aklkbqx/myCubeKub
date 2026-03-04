@@ -4,7 +4,7 @@ import { ApiError, api, type FileInfo } from "@/lib/api";
 import { formatBytes } from "@/lib/utils";
 import {
     Folder, File, ArrowLeft, Trash2, Download, Upload,
-    FolderPlus, Edit3, X, Check, Inbox, HardDriveDownload, Search, ArrowUpDown, FolderUp,
+    FolderPlus, Edit3, X, Check, Inbox, HardDriveDownload, Search, ArrowUpDown, FolderUp, RefreshCw,
 } from "lucide-react";
 import { LoadingOverlay } from "./LoadingOverlay";
 import SelectDropdown from "./SelectDropdown";
@@ -113,7 +113,6 @@ const ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
 const ZIP_CENTRAL_FILE_HEADER_SIGNATURE = 0x02014b50;
 const ZIP_END_OF_CENTRAL_DIR_SIGNATURE = 0x06054b50;
 const MAX_ARCHIVE_UPLOAD_BYTES = 1024 * 1024 * 1024;
-const SMART_ARCHIVE_MIN_FILES = 24;
 const textEncoder = new TextEncoder();
 
 const CRC32_TABLE = (() => {
@@ -209,6 +208,7 @@ async function collectDropCandidates(
 ): Promise<DropCollectionResult> {
     const items = Array.from(event.dataTransfer.items || []);
     const supportsEntries = items.some((item) => typeof (item as any).webkitGetAsEntry === "function");
+    const supportsFileSystemHandles = items.some((item) => typeof (item as any).getAsFileSystemHandle === "function");
     const fromFileList = Array.from(event.dataTransfer.files || []).map((file) => ({
         file,
         relativeDir: getFileRelativeDirectory(file),
@@ -218,46 +218,80 @@ async function collectDropCandidates(
     const collectedFromEntries: UploadCandidate[] = [];
     const discoveredDirectories = new Set<string>();
 
-    const readDirectoryEntries = async (reader: any): Promise<any[]> => {
-        const entries: any[] = [];
-        let page = 0;
-        while (true) {
-            const chunk = await new Promise<any[]>((resolve, reject) => {
+    const readDirectoryEntries = async (entry: any, attempts = 3): Promise<any[]> => {
+        let lastError: any = null;
+
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            try {
+                const reader = entry.createReader();
+                const entries: any[] = [];
+                let page = 0;
+
+                while (true) {
+                    const chunk = await new Promise<any[]>((resolve, reject) => {
+                        try {
+                            reader.readEntries(
+                                (batch: any[]) => resolve(batch || []),
+                                (err: any) => reject(err || new Error("Failed to read directory entries"))
+                            );
+                        } catch (err) {
+                            reject(err);
+                        }
+                    });
+
+                    if (!chunk.length) {
+                        break;
+                    }
+
+                    entries.push(...chunk);
+                    page += 1;
+                    // Safety guard against endless browser read loops while still preferring completeness.
+                    if (page > 100_000) {
+                        throw new Error("Directory read exceeded safe page limit");
+                    }
+                }
+
+                return entries;
+            } catch (err: any) {
+                lastError = err;
+                if (attempt < attempts) {
+                    await wait(120 * attempt);
+                }
+            }
+        }
+
+        throw lastError || new Error("Failed to read directory entries");
+    };
+
+    const readFileFromEntry = async (
+        entry: any,
+        attempts = 3
+    ): Promise<{ file: File | null; error?: unknown }> => {
+        let lastError: unknown = null;
+
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            const result = await new Promise<{ file: File | null; error?: unknown }>((resolve) => {
                 try {
-                    reader.readEntries(
-                        (batch: any[]) => resolve(batch || []),
-                        (err: any) => reject(err || new Error("Failed to read directory entries"))
+                    entry.file(
+                        (file: File) => resolve({ file }),
+                        (err: unknown) => resolve({ file: null, error: err })
                     );
                 } catch (err) {
-                    reject(err);
+                    resolve({ file: null, error: err });
                 }
             });
 
-            if (!chunk.length) {
-                break;
+            if (result.file) {
+                return result;
             }
 
-            entries.push(...chunk);
-            page += 1;
-            // Safety guard against endless browser read loops while still preferring completeness.
-            if (page > 100_000) {
-                throw new Error("Directory read exceeded safe page limit");
+            lastError = result.error || lastError;
+            if (attempt < attempts) {
+                await wait(120 * attempt);
             }
         }
-        return entries;
-    };
 
-    const readFileFromEntry = async (entry: any): Promise<File | null> => {
-        return new Promise<File | null>((resolve) => {
-            try {
-                entry.file(
-                    (file: File) => resolve(file),
-                    () => resolve(null)
-                );
-            } catch {
-                resolve(null);
-            }
-        });
+        return { file: null, error: lastError };
     };
 
     const traverseEntry = async (entry: any, parentDir: string) => {
@@ -266,12 +300,15 @@ async function collectDropCandidates(
         const safeParentDir = normalizeRelativeDir(parentDir);
 
         if (entry.isFile) {
-            const file = await readFileFromEntry(entry);
+            const { file, error: fileReadError } = await readFileFromEntry(entry);
             const filePath = normalizeJoinPath(safeParentDir, entry.name || "");
             if (!file) {
                 skipped.push({
                     path: sanitizeRelativePath(filePath),
-                    reason: "Unable to read dropped file from DataTransfer entry",
+                    reason:
+                        fileReadError instanceof Error
+                            ? fileReadError.message
+                            : "Unable to read dropped file from DataTransfer entry",
                 });
                 return;
             }
@@ -296,8 +333,7 @@ async function collectDropCandidates(
             if (nextParent) {
                 discoveredDirectories.add(nextParent);
             }
-            const reader = entry.createReader();
-            const children = await readDirectoryEntries(reader);
+            const children = await readDirectoryEntries(entry);
             if (children.length === 0) {
                 return;
             }
@@ -312,16 +348,104 @@ async function collectDropCandidates(
         }
     };
 
-    if (supportsEntries) {
-        for (const item of items) {
-            const entry = (item as any).webkitGetAsEntry?.();
-            if (!entry) continue;
-            await traverseEntry(entry, "");
+    const traverseHandle = async (handle: any, parentDir: string) => {
+        if (!handle) return;
+
+        const safeParentDir = normalizeRelativeDir(parentDir);
+
+        if (handle.kind === "file") {
+            let file: File | null = null;
+            let fileError: unknown = null;
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+                try {
+                    file = await handle.getFile();
+                    break;
+                } catch (err) {
+                    fileError = err;
+                    if (attempt < 3) {
+                        await wait(120 * attempt);
+                    }
+                }
+            }
+
+            const filePath = normalizeJoinPath(safeParentDir, handle.name || "");
+            if (!file) {
+                skipped.push({
+                    path: sanitizeRelativePath(filePath),
+                    reason:
+                        fileError instanceof Error
+                            ? fileError.message
+                            : "Unable to read dropped file from FileSystem handle",
+                });
+                return;
+            }
+
+            collectedFromEntries.push({
+                file,
+                relativeDir: safeParentDir,
+            });
+            return;
+        }
+
+        if (handle.kind !== "directory") {
+            skipped.push({
+                path: sanitizeRelativePath(normalizeJoinPath(safeParentDir, handle.name || "")),
+                reason: "Unsupported dropped item type",
+            });
+            return;
+        }
+
+        const nextParent = normalizeRelativeDir(normalizeJoinPath(safeParentDir, handle.name || ""));
+        if (nextParent) {
+            discoveredDirectories.add(nextParent);
+        }
+
+        try {
+            for await (const [, childHandle] of handle.entries()) {
+                await traverseHandle(childHandle, nextParent);
+            }
+        } catch (err: any) {
+            skipped.push({
+                path: sanitizeRelativePath(nextParent),
+                reason: err?.message || "Failed to traverse dropped directory",
+            });
+        }
+    };
+
+    if (supportsFileSystemHandles || supportsEntries) {
+        const rootSources = await Promise.all(
+            items.map(async (item) => {
+                let handle: any = null;
+                if (supportsFileSystemHandles) {
+                    try {
+                        // Capture handle immediately to avoid stale DataTransfer items
+                        // when a previous large folder traversal takes a long time.
+                        handle = await (item as any).getAsFileSystemHandle?.();
+                    } catch {
+                        handle = null;
+                    }
+                }
+
+                const entry = supportsEntries ? (item as any).webkitGetAsEntry?.() : null;
+                return { handle, entry };
+            })
+        );
+
+        for (const source of rootSources) {
+            if (source.handle) {
+                await traverseHandle(source.handle, "");
+                continue;
+            }
+
+            if (source.entry) {
+                await traverseEntry(source.entry, "");
+            }
         }
     }
 
     const mergedByPath = new Map<string, UploadCandidate>();
-    const looseFingerprints = new Map<string, string>();
+    const rootPathByLooseKey = new Map<string, string>();
+    const hasRelativeByLooseKey = new Set<string>();
     const allCandidates = [...collectedFromEntries, ...fromFileList];
 
     for (const candidate of allCandidates) {
@@ -341,25 +465,28 @@ async function collectDropCandidates(
             }
             continue;
         }
+
         const looseKey = `${normalizedCandidate.file.name}:${normalizedCandidate.file.size}:${normalizedCandidate.file.lastModified}`;
-        const preferredKey = looseFingerprints.get(looseKey);
-        if (preferredKey) {
-            const existingPreferred = mergedByPath.get(preferredKey);
-            if (existingPreferred && !existingPreferred.relativeDir && relativeDir) {
-                mergedByPath.delete(preferredKey);
-                mergedByPath.set(pathKey, normalizedCandidate);
-                looseFingerprints.set(looseKey, pathKey);
-            } else if (existingPreferred && existingPreferred.relativeDir && !relativeDir) {
+
+        if (!relativeDir) {
+            if (hasRelativeByLooseKey.has(looseKey)) {
                 continue;
-            } else {
-                mergedByPath.set(pathKey, normalizedCandidate);
-                looseFingerprints.set(looseKey, pathKey);
             }
+            if (!rootPathByLooseKey.has(looseKey)) {
+                rootPathByLooseKey.set(looseKey, pathKey);
+            }
+            mergedByPath.set(pathKey, normalizedCandidate);
             continue;
         }
 
+        hasRelativeByLooseKey.add(looseKey);
+        const existingRootPath = rootPathByLooseKey.get(looseKey);
+        if (existingRootPath) {
+            mergedByPath.delete(existingRootPath);
+            rootPathByLooseKey.delete(looseKey);
+        }
+
         mergedByPath.set(pathKey, normalizedCandidate);
-        looseFingerprints.set(looseKey, pathKey);
     }
 
     const result: DropCollectionResult = {
@@ -671,7 +798,7 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
 
     useEffect(() => {
         const interval = setInterval(() => {
-            void fetchFiles({ silent: true, resetIndicators: true });
+            void fetchFiles({ silent: true });
         }, 5_000);
 
         return () => clearInterval(interval);
@@ -801,16 +928,9 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         let completedCount = 0;
         let preparedCount = uploadItems.length;
         let terminalErrorMessage = "";
-        const shouldPreserveRelativeDirectories = Boolean(options?.preserveRelativeDirectories);
-        const hasRelativeDirectories = candidates.some(
-            (candidate) => normalizeRelativeDir(candidate.relativeDir || getFileRelativeDirectory(candidate.file)).length > 0
-        );
         const shouldUseArchiveUpload =
             Boolean(options?.forceArchiveUpload) ||
-            Boolean(options?.useArchiveForFolders) ||
-            shouldPreserveRelativeDirectories ||
-            uploadItems.length > 1 ||
-            (uploadItems.length >= SMART_ARCHIVE_MIN_FILES && (hasRelativeDirectories || !targetPath));
+            candidates.length > 0;
         let archiveUploaded = false;
         let fallbackToDirectUpload = false;
 
@@ -1040,6 +1160,83 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
     };
 
     const handleUploadFolder = async () => {
+        const pickerWindow = window as Window & {
+            showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<any>;
+        };
+
+        if (typeof pickerWindow.showDirectoryPicker === "function") {
+            try {
+                const rootHandle = await pickerWindow.showDirectoryPicker({ mode: "read" });
+                if (!rootHandle) {
+                    return;
+                }
+
+                const rootDirName = sanitizeRelativePath(rootHandle.name || "");
+                const candidates: UploadCandidate[] = [];
+                const directories = new Set<string>();
+
+                if (rootDirName) {
+                    directories.add(rootDirName);
+                }
+
+                const traverseHandle = async (handle: any, parentDir: string) => {
+                    if (!handle) return;
+
+                    if (handle.kind === "file") {
+                        let file: File | null = null;
+                        for (let attempt = 1; attempt <= 3; attempt += 1) {
+                            try {
+                                file = await handle.getFile();
+                                break;
+                            } catch {
+                                if (attempt < 3) {
+                                    await wait(120 * attempt);
+                                }
+                            }
+                        }
+                        if (!file) return;
+                        candidates.push({ file, relativeDir: parentDir });
+                        return;
+                    }
+
+                    if (handle.kind !== "directory") {
+                        return;
+                    }
+
+                    const nextParent = sanitizeRelativePath(normalizeJoinPath(parentDir, handle.name || ""));
+                    if (nextParent) {
+                        directories.add(nextParent);
+                    }
+
+                    for await (const [, child] of handle.entries()) {
+                        await traverseHandle(child, nextParent);
+                    }
+                };
+
+                for await (const [, child] of rootHandle.entries()) {
+                    await traverseHandle(child, rootDirName);
+                }
+
+                if (!candidates.length) {
+                    setCollectionWarning("No readable files were found in the selected folder.");
+                    return;
+                }
+
+                setCollectionWarning("");
+                await uploadFiles(candidates, undefined, {
+                    preserveRelativeDirectories: true,
+                    expectedFiles: candidates.length,
+                    directoriesToEnsure: Array.from(directories),
+                    useArchiveForFolders: true,
+                });
+                return;
+            } catch (err: any) {
+                if (err?.name === "AbortError") {
+                    return;
+                }
+            }
+        }
+
         folderInputRef.current?.click();
     };
 
@@ -1049,6 +1246,52 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
 
         setCollectionWarning("");
         await uploadFiles(selectedFiles);
+        e.target.value = "";
+    };
+
+    const handleFolderSelection = async (e: ChangeEvent<HTMLInputElement>) => {
+        const selectedFiles = e.target.files;
+        if (!selectedFiles?.length) return;
+
+        const files = Array.from(selectedFiles);
+        const explicitRootSegments = Array.from(
+            new Set(
+                files
+                    .map((file) => ((file as File & { webkitRelativePath?: string }).webkitRelativePath || "").split("/")[0] || "")
+                    .map((segment) => sanitizeRelativePath(segment))
+                    .filter(Boolean)
+            )
+        );
+        const fallbackRoot =
+            explicitRootSegments.length === 1
+                ? explicitRootSegments[0]
+                : `uploaded-folder-${Date.now()}`;
+        let missingRelativePathCount = 0;
+        const candidates: UploadCandidate[] = files.map((file, index) => {
+            const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || "";
+            const hasRelativePath = relativePath.includes("/");
+            if (!hasRelativePath) {
+                missingRelativePathCount += 1;
+            }
+            const relativeDir = hasRelativePath
+                ? sanitizeRelativePath(relativePath.split("/").slice(0, -1).join("/"))
+                : sanitizeRelativePath(`${fallbackRoot}/_missing-path/${index + 1}`);
+            return { file, relativeDir };
+        });
+
+        if (files.length >= 5 && missingRelativePathCount / files.length > 0.35) {
+            setCollectionWarning("Many selected files have missing relative paths. Preserved files are placed under _missing-path to avoid collisions.");
+        } else if (missingRelativePathCount > 0) {
+            setCollectionWarning(`${missingRelativePathCount} file${missingRelativePathCount > 1 ? "s" : ""} had missing relative paths and were preserved under _missing-path.`);
+        } else {
+            setCollectionWarning("");
+        }
+        await uploadFiles(candidates, undefined, {
+            preserveRelativeDirectories: true,
+            expectedFiles: files.length,
+            directoriesToEnsure: collectDirectoriesFromCandidates(candidates),
+            useArchiveForFolders: true,
+        });
         e.target.value = "";
     };
 
@@ -1142,26 +1385,6 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         });
     };
 
-    const handleFolderSelection = async (e: ChangeEvent<HTMLInputElement>) => {
-        const selectedFiles = e.target.files;
-        if (!selectedFiles?.length) return;
-
-        const files = Array.from(selectedFiles);
-        const emptyRelativeCount = files.filter((file) => !getFileRelativeDirectory(file)).length;
-        if (files.length >= 5 && emptyRelativeCount / files.length > 0.35) {
-            setCollectionWarning("Many selected files have missing relative paths. Folder structure may be flattened.");
-        } else {
-            setCollectionWarning("");
-        }
-
-        await uploadFiles(selectedFiles, undefined, {
-            preserveRelativeDirectories: true,
-            expectedFiles: files.length,
-            useArchiveForFolders: true,
-        });
-        e.target.value = "";
-    };
-
     const handleFileClick = (file: FileInfo) => {
         if (file.isDirectory) {
             navigateToFolder(file.path);
@@ -1221,8 +1444,15 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         setSelectedPaths(allFilesSelected ? [] : selectableItems.map((file) => file.path));
     };
 
-    const downloadFromUrl = useCallback(async (url: string, fallbackName: string) => {
-        const response = await fetch(url, { credentials: "include" });
+    const downloadFromUrl = useCallback(async (
+        url: string,
+        fallbackName: string,
+        init?: RequestInit
+    ) => {
+        const response = await fetch(url, {
+            credentials: "include",
+            ...init,
+        });
         const responseContentType = response.headers.get("content-type") || "";
 
         if (!response.ok) {
@@ -1277,12 +1507,21 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         setError("");
 
         try {
-            for (const file of visibleSelectedItems) {
-                await triggerDownload(file.path);
-                await new Promise((resolve) => setTimeout(resolve, 150));
-            }
+            await downloadFromUrl(
+                api.files.downloadSelectedUrl(serverId),
+                "selected-items.tar.gz",
+                {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        paths: visibleSelectedItems.map((item) => item.path),
+                    }),
+                }
+            );
         } catch (err: any) {
-            setError(err.message || "Failed to download selected files.");
+            setError(err.message || "Failed to download selected items.");
         } finally {
             setDownloading(false);
         }
@@ -1338,6 +1577,11 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         }
     };
 
+    const handleRefresh = async () => {
+        if (refreshing || loading || downloading || uploading) return;
+        await fetchFiles({ silent: true });
+    };
+
     const breadcrumbs = normalizedCurrentPath ? normalizedCurrentPath.split("/").filter(Boolean) : [];
 
     const isTextFile = (name: string) => {
@@ -1371,14 +1615,9 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                             ? "Preparing downloads"
                             : "Loading files"
                     }
+                    mode="fixed"
                     subtle
                 />
-            )}
-
-            {!loading && refreshing && !uploading && !downloading && (
-                <div className="pointer-events-none absolute right-4 top-4 z-20 rounded-full border border-surface-700/70 bg-surface-900/80 px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] text-surface-400 backdrop-blur-md">
-                    Refreshing
-                </div>
             )}
             <input
                 ref={fileInputRef}
@@ -1509,10 +1748,20 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                 </div>
 
                 <div className="flex items-center justify-end gap-2">
+                    <IconTooltip label="Refresh files">
+                        <button
+                            onClick={handleRefresh}
+                            disabled={refreshing || loading || downloading || uploading}
+                            className="btn-icon text-surface-400 hover:text-surface-200 disabled:cursor-not-allowed disabled:opacity-40"
+                            aria-label="Refresh file list"
+                        >
+                            <RefreshCw size={16} className={refreshing ? "animate-spin" : ""} />
+                        </button>
+                    </IconTooltip>
                     <IconTooltip label="Download all">
                         <button
                             onClick={handleDownloadAll}
-                            disabled={downloading || uploading}
+                            disabled={refreshing || loading || downloading || uploading}
                             className="btn-icon text-surface-400 hover:text-surface-200 disabled:cursor-not-allowed disabled:opacity-40"
                             aria-label="Download entire data folder"
                         >

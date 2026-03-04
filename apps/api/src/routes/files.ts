@@ -83,6 +83,11 @@ function toPathArchiveFilename(path: string) {
   return `${safeName}.tar.gz`;
 }
 
+function toSelectedArchiveFilename(serverName: string) {
+  const safeName = serverName.replace(/[^a-zA-Z0-9-_]+/g, "-").replace(/-+/g, "-") || "server";
+  return `${safeName}-selected.tar.gz`;
+}
+
 function parseNonNegativeInteger(value: string | null) {
   if (!value) return null;
   const parsed = Number(value);
@@ -698,6 +703,84 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
       }),
       response: {
         200: t.Object({ success: t.Boolean() }),
+        400: errorResponse,
+        401: errorResponse,
+        404: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+
+  // ─── Download selected files/folders as one archive ──────
+  .post(
+    "/:id/files/download-selected",
+    async ({ params: { id }, body, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      const normalizedPaths = Array.from(
+        new Set(
+          (body.paths || [])
+            .map((item) => normalizeRelativePath(item))
+            .filter(Boolean)
+        )
+      );
+
+      if (normalizedPaths.length === 0) {
+        set.status = 400;
+        return { error: "No files or folders selected" };
+      }
+
+      try {
+        const dataDir = safePath(id, "");
+        if (!existsSync(dataDir)) {
+          set.status = 404;
+          return { error: "Server data directory not found" };
+        }
+
+        for (const selectedPath of normalizedPaths) {
+          const targetPath = safePath(id, selectedPath);
+          if (!existsSync(targetPath)) {
+            set.status = 404;
+            return { error: `Selected path not found: ${selectedPath}` };
+          }
+        }
+
+        const archiveName = toSelectedArchiveFilename(server.name);
+        const proc = Bun.spawn(["tar", "-czf", "-", "--", ...normalizedPaths], {
+          cwd: dataDir,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+
+        set.headers["content-type"] = "application/gzip";
+        set.headers["content-disposition"] = `attachment; filename="${archiveName}"`;
+
+        return new Response(proc.stdout, {
+          headers: {
+            "content-type": "application/gzip",
+            "content-disposition": `attachment; filename="${archiveName}"`,
+          },
+        });
+      } catch (err: any) {
+        set.status = 500;
+        return { error: err.message || "Failed to download selected files" };
+      }
+    },
+    {
+      params: t.Object({ id: t.String() }),
+      body: t.Object({
+        paths: t.Array(t.String(), { minItems: 1 }),
+      }),
+      response: {
         400: errorResponse,
         401: errorResponse,
         404: errorResponse,

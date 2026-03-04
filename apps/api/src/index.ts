@@ -321,6 +321,19 @@ async function waitForReadiness(
 let apiServer: unknown;
 let docsServer: unknown;
 
+const isAlreadyStoppedServerError = (error: unknown) => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("isn't running") ||
+    message.includes("not running") ||
+    message.includes("already closed")
+  );
+};
+
 const stopServer = async (server: any) => {
   if (!server) return;
   try {
@@ -333,6 +346,9 @@ const stopServer = async (server: any) => {
       return;
     }
   } catch (e) {
+    if (isAlreadyStoppedServerError(e)) {
+      return;
+    }
     console.warn('Error stopping server:', e);
   }
 };
@@ -345,6 +361,8 @@ const handleSignal = async (signal: NodeJS.Signals) => {
     stopServer(apiServer as any),
     stopServer(docsServer as any),
   ]);
+  apiServer = null;
+  docsServer = null;
   process.exit(0);
 };
 

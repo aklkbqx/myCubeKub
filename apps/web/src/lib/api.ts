@@ -529,6 +529,9 @@ class ApiClient {
     downloadAllUrl: (serverId: string) =>
       `/api/servers/${serverId}/files/download-all`,
 
+    downloadSelectedUrl: (serverId: string) =>
+      `/api/servers/${serverId}/files/download-selected`,
+
     downloadUrl: (serverId: string, path: string) =>
       `/api/servers/${serverId}/files/download?path=${encodeURIComponent(path)}`,
   };
