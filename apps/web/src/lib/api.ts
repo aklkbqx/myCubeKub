@@ -16,6 +16,8 @@ import type {
 } from "./api-types";
 
 const API_BASE = "/api";
+const CHUNK_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024;
+const CHUNK_UPLOAD_THRESHOLD_BYTES = 90 * 1024 * 1024;
 const treaty = edenTreaty<App>(API_BASE, {
   $fetch: {
     credentials: "include",
@@ -128,22 +130,24 @@ class ApiClient {
     });
   }
 
-  private async uploadFileWithProgress<T>(
+  private uploadFileWithProgress<T>(
     input: string,
-    file: File,
+    file: Blob,
     headers?: Record<string, string>,
     onProgress?: (progress: { loaded: number; total: number; percent: number }) => void
-  ): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("PUT", input, true);
-      xhr.withCredentials = true;
+  ): { promise: Promise<T>; cancel: () => void } {
+    let xhr: XMLHttpRequest | null = null;
+    const promise = new Promise<T>((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      xhr = request;
+      request.open("PUT", input, true);
+      request.withCredentials = true;
 
       Object.entries(headers || {}).forEach(([key, value]) => {
-        xhr.setRequestHeader(key, value);
+        request.setRequestHeader(key, value);
       });
 
-      xhr.upload.onprogress = (event) => {
+      request.upload.onprogress = (event) => {
         if (!event.lengthComputable || !onProgress) return;
 
         onProgress({
@@ -153,12 +157,13 @@ class ApiClient {
         });
       };
 
-      xhr.onerror = () => reject(new ApiError(0, "Upload failed"));
+      request.onerror = () => reject(new ApiError(0, "Upload failed"));
+      request.onabort = () => reject(new ApiError(499, "Upload canceled"));
 
-      xhr.onload = () => {
-        const payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      request.onload = () => {
+        const payload = request.responseText ? JSON.parse(request.responseText) : null;
 
-        if (xhr.status < 200 || xhr.status >= 300) {
+        if (request.status < 200 || request.status >= 300) {
           const message =
             payload &&
             typeof payload === "object" &&
@@ -167,15 +172,34 @@ class ApiClient {
               ? payload.error
               : "Request failed";
 
-          reject(new ApiError(xhr.status, message));
+          reject(new ApiError(request.status, message));
           return;
         }
 
         resolve(payload as T);
       };
 
-      xhr.send(file);
+      request.send(file);
     });
+
+    return {
+      promise,
+      cancel: () => {
+        if (!xhr) return;
+        try {
+          xhr.abort();
+        } catch {
+          // Ignore abort errors on completed requests.
+        }
+      },
+    };
+  }
+
+  private createUploadId() {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
 
   // ─── Auth ────────────────────────────────────────────────
@@ -301,12 +325,12 @@ class ApiClient {
         treaty.servers[serverId].files.rename.patch({ oldPath, newPath })
       ),
 
-    upload: (
+    uploadCancelable: (
       serverId: string,
       file: File,
       path?: string,
       onProgress?: (progress: { loaded: number; total: number; percent: number }) => void
-    ): Promise<{ success: boolean; filename: string }> => {
+    ): { promise: Promise<{ success: boolean; filename: string }>; cancel: () => void } => {
       const searchParams = new URLSearchParams();
       const normalizedPath = this.normalizeOptionalPath(path);
       if (normalizedPath) {
@@ -314,16 +338,143 @@ class ApiClient {
       }
 
       const uploadUrl = `${API_BASE}/servers/${encodeURIComponent(serverId)}/files/upload-stream${searchParams.size ? `?${searchParams.toString()}` : ""}`;
+      const baseHeaders = {
+        "X-File-Name": encodeURIComponent(file.name),
+      };
+      const uploadId = file.size > CHUNK_UPLOAD_THRESHOLD_BYTES ? this.createUploadId() : "";
 
-      return this.uploadFileWithProgress<{ success: boolean; filename: string }>(
-        uploadUrl,
-        file,
-        {
-          "Content-Type": file.type || "application/octet-stream",
-          "X-File-Name": encodeURIComponent(file.name),
+      let activeCancel: (() => void) | null = null;
+      let canceled = false;
+      let cleanupTriggered = false;
+
+      const cleanupChunkSession = async () => {
+        if (!uploadId || cleanupTriggered) return;
+        cleanupTriggered = true;
+
+        const cleanupParams = new URLSearchParams();
+        cleanupParams.set("uploadId", uploadId);
+        cleanupParams.set("fileName", encodeURIComponent(file.name));
+        if (normalizedPath) {
+          cleanupParams.set("path", normalizedPath);
+        }
+
+        try {
+          await this.requestJson<{ success: boolean }>(
+            `${API_BASE}/servers/${encodeURIComponent(serverId)}/files/upload-stream?${cleanupParams.toString()}`,
+            { method: "DELETE" }
+          );
+        } catch {
+          // Ignore cleanup errors after cancellation.
+        }
+      };
+
+      const promise = (async () => {
+        if (!uploadId) {
+          const request = this.uploadFileWithProgress<{ success: boolean; filename: string }>(
+            uploadUrl,
+            file,
+            {
+              ...baseHeaders,
+              "Content-Type": file.type || "application/octet-stream",
+            },
+            onProgress
+          );
+
+          activeCancel = request.cancel;
+          try {
+            return await request.promise;
+          } catch (err) {
+            if (canceled) {
+              throw new ApiError(499, "Upload canceled");
+            }
+            throw err;
+          } finally {
+            activeCancel = null;
+          }
+        }
+
+        const totalSize = file.size;
+        const totalChunks = Math.ceil(totalSize / CHUNK_UPLOAD_SIZE_BYTES);
+        let uploadedBytes = 0;
+        let lastResponse: { success: boolean; filename: string } | null = null;
+
+        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+          if (canceled) {
+            await cleanupChunkSession();
+            throw new ApiError(499, "Upload canceled");
+          }
+
+          const start = chunkIndex * CHUNK_UPLOAD_SIZE_BYTES;
+          const end = Math.min(start + CHUNK_UPLOAD_SIZE_BYTES, totalSize);
+          const chunk = file.slice(start, end);
+          const request = this.uploadFileWithProgress<{ success: boolean; filename: string }>(
+            uploadUrl,
+            chunk,
+            {
+              ...baseHeaders,
+              "Content-Type": "application/octet-stream",
+              "X-Upload-Id": uploadId,
+              "X-Chunk-Index": String(chunkIndex),
+              "X-Chunk-Total": String(totalChunks),
+            },
+            onProgress
+              ? (progress) => {
+                const loaded = Math.min(uploadedBytes + progress.loaded, totalSize);
+                onProgress({
+                  loaded,
+                  total: totalSize,
+                  percent: Math.round((loaded / totalSize) * 100),
+                });
+              }
+              : undefined
+          );
+
+          activeCancel = request.cancel;
+          try {
+            lastResponse = await request.promise;
+          } catch (err) {
+            if (canceled) {
+              await cleanupChunkSession();
+              throw new ApiError(499, "Upload canceled");
+            }
+            throw err;
+          } finally {
+            activeCancel = null;
+          }
+
+          uploadedBytes = end;
+          if (onProgress) {
+            onProgress({
+              loaded: uploadedBytes,
+              total: totalSize,
+              percent: Math.round((uploadedBytes / totalSize) * 100),
+            });
+          }
+        }
+
+        if (!lastResponse) {
+          throw new ApiError(0, "Upload failed");
+        }
+        return lastResponse;
+      })();
+
+      return {
+        promise,
+        cancel: () => {
+          canceled = true;
+          activeCancel?.();
+          void cleanupChunkSession();
         },
-        onProgress
-      );
+      };
+    },
+
+    upload: (
+      serverId: string,
+      file: File,
+      path?: string,
+      onProgress?: (progress: { loaded: number; total: number; percent: number }) => void
+    ): Promise<{ success: boolean; filename: string }> => {
+      return this.files.uploadCancelable(serverId, file, path, onProgress).promise;
     },
 
     downloadAllUrl: (serverId: string) =>

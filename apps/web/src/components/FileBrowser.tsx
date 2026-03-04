@@ -90,6 +90,8 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
     const dragDepthRef = useRef(0);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const recentUploadTimeoutRef = useRef<number | null>(null);
+    const uploadCancelRef = useRef<(() => void) | null>(null);
+    const uploadCanceledRef = useRef(false);
 
     const normalizedCurrentPath =
         currentPath && currentPath !== "undefined" && currentPath !== "null"
@@ -142,6 +144,7 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
             if (recentUploadTimeoutRef.current) {
                 window.clearTimeout(recentUploadTimeoutRef.current);
             }
+            uploadCancelRef.current?.();
         };
     }, []);
 
@@ -205,6 +208,7 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         const destinationPath = targetPath ?? normalizedCurrentPath;
 
         setUploading(true);
+        uploadCanceledRef.current = false;
         setError("");
         setFolderDropTarget(null);
         setUploadState({
@@ -218,7 +222,7 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
         try {
             for (let index = 0; index < items.length; index += 1) {
                 const file = items[index];
-                await api.files.upload(serverId, file, destinationPath || undefined, (progress) => {
+                const uploadTask = api.files.uploadCancelable(serverId, file, destinationPath || undefined, (progress) => {
                     const overallPercent = Math.round(((index + progress.percent / 100) / items.length) * 100);
                     setUploadState({
                         targetPath: destinationPath || "data",
@@ -228,6 +232,9 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                         percent: overallPercent,
                     });
                 });
+                uploadCancelRef.current = uploadTask.cancel;
+                await uploadTask.promise;
+                uploadCancelRef.current = null;
 
                 setUploadState({
                     targetPath: destinationPath || "data",
@@ -253,12 +260,24 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
             onServerFilesChanged?.();
             await fetchFiles();
         } catch (err: any) {
-            setError(err.message || "Failed to upload file.");
+            if (uploadCanceledRef.current) {
+                setError("Upload canceled.");
+            } else {
+                setError(err.message || "Failed to upload file.");
+            }
         } finally {
+            uploadCancelRef.current = null;
+            uploadCanceledRef.current = false;
             setUploading(false);
             setUploadState(null);
         }
     }, [normalizedCurrentPath, fetchFiles, serverId]);
+
+    const handleCancelUpload = () => {
+        if (!uploading) return;
+        uploadCanceledRef.current = true;
+        uploadCancelRef.current?.();
+    };
 
     const handleUpload = async () => {
         fileInputRef.current?.click();
@@ -522,9 +541,18 @@ export function FileBrowser({ serverId, onEditFile, onServerFilesChanged }: File
                                 {uploadState.currentFileName} • {uploadState.completedFiles}/{uploadState.totalFiles} completed
                             </p>
                         </div>
-                        <span className="text-sm font-semibold text-brand-200">
-                            {uploadState.percent}%
-                        </span>
+                        <div className="flex items-center gap-3">
+                            <span className="text-sm font-semibold text-brand-200">
+                                {uploadState.percent}%
+                            </span>
+                            <button
+                                type="button"
+                                onClick={handleCancelUpload}
+                                className="rounded-lg border border-red-500/35 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/15"
+                            >
+                                Cancel upload
+                            </button>
+                        </div>
                     </div>
                     <div className="mt-3 h-2 overflow-hidden rounded-full bg-surface-800">
                         <div

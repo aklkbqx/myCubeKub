@@ -82,6 +82,13 @@ function toPathArchiveFilename(path: string) {
   return `${safeName}.tar.gz`;
 }
 
+function parseNonNegativeInteger(value: string | null) {
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
 const fileRoutes = new Elysia({ prefix: "/servers" })
   .use(authGuard)
   .onBeforeHandle(({ user, authUnavailable, set }) => {
@@ -465,7 +472,40 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
         }
 
         const filePath = join(uploadDir, fileName);
-        await pipeline(Readable.fromWeb(request.body as any), createWriteStream(filePath));
+        const chunkIndex = parseNonNegativeInteger(request.headers.get("x-chunk-index"));
+        const chunkTotal = parseNonNegativeInteger(request.headers.get("x-chunk-total"));
+        const uploadId = request.headers.get("x-upload-id")?.trim() || "";
+
+        const isChunked = chunkIndex !== null || chunkTotal !== null || uploadId.length > 0;
+        if (!isChunked) {
+          await pipeline(Readable.fromWeb(request.body as any), createWriteStream(filePath));
+          await invalidateFileCache(id);
+          return { success: true, filename: fileName };
+        }
+
+        if (!uploadId || chunkIndex === null || chunkTotal === null || chunkTotal <= 0 || chunkIndex >= chunkTotal) {
+          set.status = 400;
+          return { error: "Invalid chunk metadata" };
+        }
+
+        const tempFilePath = join(uploadDir, `.${fileName}.${uploadId}.part`);
+
+        if (chunkIndex === 0) {
+          await rm(tempFilePath, { force: true });
+        } else if (!existsSync(tempFilePath)) {
+          set.status = 409;
+          return { error: "Upload session not found. Please retry upload." };
+        }
+
+        await pipeline(
+          Readable.fromWeb(request.body as any),
+          createWriteStream(tempFilePath, { flags: chunkIndex === 0 ? "w" : "a" })
+        );
+
+        if (chunkIndex === chunkTotal - 1) {
+          await rename(tempFilePath, filePath);
+        }
+
         await invalidateFileCache(id);
 
         return { success: true, filename: fileName };
@@ -488,6 +528,66 @@ const fileRoutes = new Elysia({ prefix: "/servers" })
         401: errorResponse,
         404: errorResponse,
         413: errorResponse,
+        500: errorResponse,
+      },
+    }
+  )
+  .delete(
+    "/:id/files/upload-stream",
+    async ({ params: { id }, query, set }) => {
+      const [server] = await db
+        .select()
+        .from(schema.servers)
+        .where(eq(schema.servers.id, id))
+        .limit(1);
+
+      if (!server) {
+        set.status = 404;
+        return { error: "Server not found" };
+      }
+
+      const uploadId = query.uploadId?.trim();
+      if (!uploadId) {
+        set.status = 400;
+        return { error: "Missing upload session id" };
+      }
+
+      let decodedFileName = "";
+      try {
+        decodedFileName = decodeURIComponent(query.fileName);
+      } catch {
+        set.status = 400;
+        return { error: "Invalid file name" };
+      }
+      const fileName = basename(decodedFileName);
+      if (!fileName || fileName === "." || fileName === "..") {
+        set.status = 400;
+        return { error: "Invalid file name" };
+      }
+
+      try {
+        const uploadDir = safePath(id, normalizeRelativePath(query.path));
+        const tempFilePath = join(uploadDir, `.${fileName}.${uploadId}.part`);
+        await rm(tempFilePath, { force: true });
+        await invalidateFileCache(id);
+        return { success: true };
+      } catch (err: any) {
+        set.status = 500;
+        return { error: err.message || "Failed to cancel upload session" };
+      }
+    },
+    {
+      params: t.Object({ id: t.String() }),
+      query: t.Object({
+        uploadId: t.String(),
+        fileName: t.String(),
+        path: t.Optional(t.String()),
+      }),
+      response: {
+        200: t.Object({ success: t.Boolean() }),
+        400: errorResponse,
+        401: errorResponse,
+        404: errorResponse,
         500: errorResponse,
       },
     }
